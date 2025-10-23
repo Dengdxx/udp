@@ -1076,15 +1076,15 @@ class App(tb.Window if HAS_TTKBOOTSTRAP else tk.Tk):
         self.image_w_bytes = tk.IntVar(value=1)  # W 字段字节数 (动态模式)
         self.image_h_order = tk.StringVar(value='小端')  # 字节序
         self.image_w_order = tk.StringVar(value='小端')
-        self.image_fixed_h = tk.IntVar(value=60)  # 固定高度 (STM32模式)
-        self.image_fixed_w = tk.IntVar(value=120)  # 固定宽度 (STM32模式)
+        self.image_fixed_h = tk.IntVar(value=120)  # 固定高度 (STM32模式)
+        self.image_fixed_w = tk.IntVar(value=188)  # 固定宽度 (STM32模式)
         self.image_size_mode = tk.StringVar(value='固定尺寸')  # 固定尺寸 / 动态解析
         self.image_format = tk.StringVar(value='压缩二值(1位)')  # 图像数据编码格式
         
         # 自定义帧格式 - 日志帧
         self.enable_custom_log_frame = tk.BooleanVar(value=False)
         self.log_frame_header = tk.StringVar(value='BB66')
-        self.log_frame_footer = tk.StringVar(value='')
+        self.log_frame_footer = tk.StringVar(value='0D0A')
         self.log_frame_format = tk.StringVar(value='标准格式')  # 标准格式 / 纯文本
 
     # 已移除 C 扩展处理选项（ctypes），保持 GUI 简洁

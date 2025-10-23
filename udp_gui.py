@@ -53,6 +53,22 @@ except ImportError:
     HAS_CV2 = False
     print("[WARN] OpenCV or PIL not available, video display disabled")
 
+# 导入matplotlib用于示波器
+try:
+    import matplotlib
+    matplotlib.use('TkAgg')
+    # 设置中文字体支持
+    matplotlib.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei', 'Arial Unicode MS', 'DejaVu Sans']
+    matplotlib.rcParams['axes.unicode_minus'] = False  # 解决负号显示问题
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+    from matplotlib.figure import Figure
+    import matplotlib.pyplot as plt
+    from collections import deque
+    HAS_MATPLOTLIB = True
+except ImportError:
+    HAS_MATPLOTLIB = False
+    print("[WARN] Matplotlib not available, oscilloscope disabled")
+
 
 # 获取本机所有 IP 地址
 def get_local_ips():
@@ -128,16 +144,178 @@ def parse_binary_image_frame(data: bytes) -> Tuple[int, int, np.ndarray]:
     return h, w, img
 
 
-def parse_log_frame(data: bytes) -> Tuple[int, bytes]:
-    """解析日志帧 [0x02][LEN][TS_0..TS_7][payload...]"""
-    if len(data) < 1 + 1 + 8:
+def parse_compressed_image_frame(data: bytes, fixed_h: int = 0, fixed_w: int = 0) -> Tuple[int, int, np.ndarray]:
+    """解析STM32压缩图像帧 [FH-4bytes][compressed_pixels][FE-4bytes]
+    
+    压缩格式: 8个像素压缩成1字节, MSB优先
+    - bit7对应第1个像素, bit0对应第8个像素
+    - bit=1表示白色(255), bit=0表示黑色(0)
+    
+    Args:
+        data: 原始数据包(包含帧头帧尾)
+        fixed_h: 固定高度(从配置读取)
+        fixed_w: 固定宽度(从配置读取)
+    
+    Returns:
+        (height, width, image_array)
+    """
+    if not HAS_CV2:
+        return fixed_h, fixed_w, None
+    
+    # 最小长度检查: 帧头(4) + 帧尾(4) = 8字节
+    if len(data) < 8:
+        raise ValueError(f"compressed image frame too short: {len(data)} bytes")
+    
+    # 提取压缩的像素数据(去除帧头4字节和帧尾4字节)
+    compressed = data[4:-4]
+    
+    # 如果提供了固定尺寸,使用固定尺寸
+    if fixed_h > 0 and fixed_w > 0:
+        h = fixed_h
+        w = fixed_w
+    else:
+        # 动态计算尺寸(需要额外信息,这里暂不支持)
+        raise ValueError("compressed image requires fixed H/W in config")
+    
+    pixel_count = h * w
+    expected_compressed_bytes = (pixel_count + 7) // 8
+    
+    # 验证压缩数据长度
+    if len(compressed) < expected_compressed_bytes:
+        raise ValueError(
+            f"compressed data too short: got {len(compressed)} bytes, "
+            f"expected {expected_compressed_bytes} for {h}x{w} image"
+        )
+    
+    # 解压缩: 1字节 -> 8像素
+    img = np.zeros(pixel_count, dtype=np.uint8)
+    
+    for idx in range(pixel_count):
+        byte_idx = idx // 8
+        bit_offset = idx % 8
+        
+        # MSB优先: bit7对应第0个像素, bit0对应第7个像素
+        bit_val = (compressed[byte_idx] >> (7 - bit_offset)) & 0x01
+        img[idx] = 255 if bit_val else 0
+    
+    img = img.reshape((h, w))
+    return h, w, img
+
+
+def decode_image_by_format(pixel_data: bytes, h: int, w: int, format_type: str) -> np.ndarray:
+    """根据指定格式解码图像数据
+    
+    Args:
+        pixel_data: 原始像素数据(不含帧头帧尾、H/W字段)
+        h: 图像高度
+        w: 图像宽度
+        format_type: 图像格式类型
+    
+    Returns:
+        解码后的图像数组 (H, W, C) 或 (H, W)
+    """
+    if not HAS_CV2:
+        return None
+    
+    pixel_count = h * w
+    
+    if format_type == '灰度图(8位)':
+        # 每个像素1字节,直接读取
+        if len(pixel_data) < pixel_count:
+            raise ValueError(f"gray image data too short: need {pixel_count}, got {len(pixel_data)}")
+        img = np.frombuffer(pixel_data[:pixel_count], dtype=np.uint8)
+        return img.reshape((h, w))
+    
+    elif format_type == '二值图(8位)':
+        # 每个像素1字节, 0或255
+        if len(pixel_data) < pixel_count:
+            raise ValueError(f"binary image data too short: need {pixel_count}, got {len(pixel_data)}")
+        pixels = np.frombuffer(pixel_data[:pixel_count], dtype=np.uint8)
+        # 转换为二值(非0即255)
+        img = np.where(pixels > 127, 255, 0).astype(np.uint8)
+        return img.reshape((h, w))
+    
+    elif format_type == '压缩二值(1位)':
+        # 8个像素压缩成1字节, MSB优先
+        expected_bytes = (pixel_count + 7) // 8
+        if len(pixel_data) < expected_bytes:
+            raise ValueError(f"compressed binary data too short: need {expected_bytes}, got {len(pixel_data)}")
+        
+        img = np.zeros(pixel_count, dtype=np.uint8)
+        for idx in range(pixel_count):
+            byte_idx = idx // 8
+            bit_offset = idx % 8
+            bit_val = (pixel_data[byte_idx] >> (7 - bit_offset)) & 0x01
+            img[idx] = 255 if bit_val else 0
+        return img.reshape((h, w))
+    
+    elif format_type == 'RGB565':
+        # 每个像素2字节, RGB565格式
+        expected_bytes = pixel_count * 2
+        if len(pixel_data) < expected_bytes:
+            raise ValueError(f"RGB565 data too short: need {expected_bytes}, got {len(pixel_data)}")
+        
+        # 解析RGB565 (小端序: [G2G1G0B4B3B2B1B0][R4R3R2R1R0G5G4G3])
+        rgb565 = np.frombuffer(pixel_data[:expected_bytes], dtype=np.uint16)
+        
+        # 提取RGB分量
+        r = ((rgb565 & 0xF800) >> 11).astype(np.uint8)  # 5位R
+        g = ((rgb565 & 0x07E0) >> 5).astype(np.uint8)   # 6位G
+        b = (rgb565 & 0x001F).astype(np.uint8)          # 5位B
+        
+        # 扩展到8位 (5位->8位: x8+x3, 6位->8位: x4+x2)
+        r = (r << 3) | (r >> 2)
+        g = (g << 2) | (g >> 4)
+        b = (b << 3) | (b >> 2)
+        
+        # 组合成RGB图像
+        img = np.stack([r, g, b], axis=-1)
+        return img.reshape((h, w, 3))
+    
+    elif format_type == 'RGB888':
+        # 每个像素3字节, RGB888格式
+        expected_bytes = pixel_count * 3
+        if len(pixel_data) < expected_bytes:
+            raise ValueError(f"RGB888 data too short: need {expected_bytes}, got {len(pixel_data)}")
+        
+        img = np.frombuffer(pixel_data[:expected_bytes], dtype=np.uint8)
+        return img.reshape((h, w, 3))
+    
+    elif format_type == 'BGR888':
+        # 每个像素3字节, BGR888格式
+        expected_bytes = pixel_count * 3
+        if len(pixel_data) < expected_bytes:
+            raise ValueError(f"BGR888 data too short: need {expected_bytes}, got {len(pixel_data)}")
+        
+        img = np.frombuffer(pixel_data[:expected_bytes], dtype=np.uint8)
+        img = img.reshape((h, w, 3))
+        # BGR转RGB
+        return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    
+    elif format_type == 'RGBA8888':
+        # 每个像素4字节, RGBA8888格式
+        expected_bytes = pixel_count * 4
+        if len(pixel_data) < expected_bytes:
+            raise ValueError(f"RGBA8888 data too short: need {expected_bytes}, got {len(pixel_data)}")
+        
+        img = np.frombuffer(pixel_data[:expected_bytes], dtype=np.uint8)
+        img = img.reshape((h, w, 4))
+        # 只取RGB通道
+        return img[:, :, :3]
+    
+    else:
+        raise ValueError(f"Unknown image format: {format_type}")
+
+
+def parse_log_frame(data: bytes) -> bytes:
+    """解析日志帧 [0x02][LEN][payload...]"""
+    if len(data) < 1 + 1:
         raise ValueError("log frame too short")
     length = data[1]
-    if len(data) != 1 + 1 + 8 + length:
+    if len(data) != 1 + 1 + length:
         raise ValueError("log frame size mismatch")
-    ts_us = struct.unpack_from('<Q', data, 2)[0]
-    payload = data[10:10 + length]
-    return ts_us, payload
+    payload = data[2:2 + length]
+    return payload
 
 
 # ---------------------- UDP 接收线程 ----------------------
@@ -157,6 +335,7 @@ class UdpVideoReceiver:
                  image_w_order: str = '小端',
                  image_fixed_h: int = 0,  # 固定高度 (0表示从数据解析)
                  image_fixed_w: int = 0,  # 固定宽度 (0表示从数据解析)
+                 image_format: str = '灰度图(8位)',  # 图像数据编码格式
                  enable_custom_log_frame: bool = False,
                  log_frame_header: str = '',
                  log_frame_footer: str = '',
@@ -178,6 +357,7 @@ class UdpVideoReceiver:
         self.image_w_order = image_w_order
         self.image_fixed_h = image_fixed_h
         self.image_fixed_w = image_fixed_w
+        self.image_format = image_format
         
         # 自定义日志帧格式
         self.enable_custom_log_frame = enable_custom_log_frame
@@ -207,6 +387,11 @@ class UdpVideoReceiver:
         self.max_recent_data = 100  # 最多保存100条
         self.data_lock = threading.Lock()
         
+        # 示波器数据缓存
+        self.scope_data = {}  # {byte_index: deque([(timestamp, value), ...], maxlen=1000)}
+        self.scope_lock = threading.Lock()
+        self.scope_start_time = time.time()  # 示波器开始时间
+        
         # CSV 文件
         self._log_csv_fp: Optional[object] = None
         self._log_writer: Optional[object] = None
@@ -232,13 +417,13 @@ class UdpVideoReceiver:
             self._log_csv_fp = open(self.log_csv, 'a', newline='', encoding='utf-8')
             self._log_writer = csv.writer(self._log_csv_fp)
             if not log_csv_exists:
-                self._log_writer.writerow(["stm32_ts_us", "host_recv_iso", "log_text_hex", "log_text_utf8"])
+                self._log_writer.writerow(["host_recv_iso", "log_text_hex", "log_text_utf8"])
             
             frame_csv_exists = os.path.exists(self.frame_index_csv) and os.path.getsize(self.frame_index_csv) > 0
             self._frame_index_fp = open(self.frame_index_csv, 'a', newline='', encoding='utf-8')
             self._frame_index_writer = csv.writer(self._frame_index_fp)
             if not frame_csv_exists:
-                self._frame_index_writer.writerow(["frame_id", "stm32_ts_us", "host_recv_iso", "png_path", "h", "w"])
+                self._frame_index_writer.writerow(["frame_id", "host_recv_iso", "png_path", "h", "w"])
             
             # 启动线程
             self._stop_event.clear()
@@ -326,8 +511,8 @@ class UdpVideoReceiver:
         
         return frame_data
     
-    def _parse_custom_log_frame(self, data: bytes) -> Optional[tuple]:
-        """解析自定义日志帧格式，返回 (timestamp_us, payload)"""
+    def _parse_custom_log_frame(self, data: bytes) -> Optional[bytes]:
+        """解析自定义日志帧格式，返回 payload"""
         if not self.enable_custom_log_frame or not self.log_frame_header_bytes:
             return None
         
@@ -354,26 +539,26 @@ class UdpVideoReceiver:
         
         # 根据格式解析
         if self.log_frame_format == '标准格式':
-            # 标准格式: [0x02][LEN][TS_8bytes][payload]
-            if len(frame_data) < 10:  # 至少需要 1+1+8
+            # 标准格式: [0x02][LEN][payload]
+            if len(frame_data) < 2:  # 至少需要 1+1
                 return None
             try:
                 return parse_log_frame(frame_data)
             except:
                 return None
         else:  # 纯文本
-            # 纯文本格式，没有时间戳
-            return (-1, frame_data)
+            # 纯文本格式，直接返回内容
+            return frame_data
     
     def _parse_custom_image_data(self, data: bytes) -> Optional[Tuple[int, int, np.ndarray]]:
         """根据自定义格式解析图像数据
         
         支持两种模式:
         1. 固定尺寸模式: 图像数据只包含像素，H/W通过配置指定
-           格式: [像素数据 H×W字节]
+           格式: [像素数据]
         
         2. 动态尺寸模式: 图像数据包含H/W字段
-           格式: [H-N字节][W-M字节][像素数据 H×W字节]
+           格式: [H-N字节][W-M字节][像素数据]
         
         注意: data参数已经去除了帧头和帧尾，只包含图像数据部分
         """
@@ -385,14 +570,12 @@ class UdpVideoReceiver:
             if self.image_fixed_h > 0 and self.image_fixed_w > 0:
                 h = self.image_fixed_h
                 w = self.image_fixed_w
-                expected_pixels = h * w
                 
-                if len(data) < expected_pixels:
-                    print(f"[WARN] Fixed size mode: expected {expected_pixels} bytes, got {len(data)}")
+                # 使用格式解码器解码像素数据
+                img = decode_image_by_format(data, h, w, self.image_format)
+                
+                if img is None:
                     return None
-                
-                pixels = np.frombuffer(data[:expected_pixels], dtype=np.uint8)
-                img = pixels.reshape((h, w))
                 
                 return h, w, img
             
@@ -419,14 +602,12 @@ class UdpVideoReceiver:
                     w = int.from_bytes(w_bytes, 'little')
                 idx += self.image_w_bytes
                 
-                # 解析像素数据
-                expected_pixels = h * w
-                if len(data) < idx + expected_pixels:
-                    print(f"[WARN] Dynamic size mode: expected {idx + expected_pixels}, got {len(data)}")
-                    return None
+                # 使用格式解码器解码像素数据
+                pixel_data = data[idx:]
+                img = decode_image_by_format(pixel_data, h, w, self.image_format)
                 
-                pixels = np.frombuffer(data[idx:idx+expected_pixels], dtype=np.uint8)
-                img = pixels.reshape((h, w))
+                if img is None:
+                    return None
                 
                 return h, w, img
             
@@ -454,14 +635,31 @@ class UdpVideoReceiver:
             
             self.total_packets += 1
             host_iso = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
+            recv_time = time.time()
             
             if not data:
                 continue
+            
+            # 提取示波器数据(从原始UDP数据包中)
+            if self.scope_data:
+                with self.scope_lock:
+                    for key in self.scope_data:
+                        byte_idx, bit_idx = key
+                        if byte_idx < len(data):
+                            byte_val = data[byte_idx]
+                            if bit_idx is not None:
+                                # 提取特定位
+                                value = (byte_val >> bit_idx) & 1
+                            else:
+                                # 整个字节值
+                                value = byte_val
+                            self.scope_data[key].append((recv_time, value))
             
             # 尝试解析自定义图像帧
             if self.enable_custom_image_frame:
                 custom_image_data = self._parse_custom_frame(data)
                 if custom_image_data is not None:
+                    # 使用统一的自定义图像解析器(会根据格式自动选择解码方式)
                     result = self._parse_custom_image_data(custom_image_data)
                     if result is not None:
                         h, w, img = result
@@ -472,30 +670,42 @@ class UdpVideoReceiver:
                             with self.frame_lock:
                                 self.current_frame = img.copy()
                             
+                            # 根据图像格式生成描述信息
+                            format_name = self.image_format
+                            if format_name == '压缩二值(1位)':
+                                data_size = len(custom_image_data)
+                                compression_ratio = (h * w) / data_size if data_size > 0 else 0
+                                info = f"{format_name} Frame {self.frame_counter}: {w}x{h}, {data_size} bytes ({compression_ratio:.1f}:1)"
+                            else:
+                                info = f"{format_name} Frame {self.frame_counter}: {w}x{h}, {len(data)} bytes total"
+                            
                             with self.data_lock:
                                 self.recent_data.append((
                                     host_iso,
                                     'CUSTOM_IMAGE',
                                     data[:100].hex() + ('...' if len(data) > 100 else ''),
-                                    f"Custom Image Frame {self.frame_counter}: {w}x{h}, {len(data)} bytes total"
+                                    info
                                 ))
                                 if len(self.recent_data) > self.max_recent_data:
                                     self.recent_data.pop(0)
                             
                             if self.save_png:
                                 png_path = os.path.join(self.png_dir, f"frame_{self.frame_counter:06d}.png")
-                                cv2.imwrite(png_path, img)
+                                # 对于彩色图像,需要转换为BGR保存
+                                if len(img.shape) == 3:
+                                    cv2.imwrite(png_path, cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+                                else:
+                                    cv2.imwrite(png_path, img)
                                 if self._frame_index_writer:
-                                    self._frame_index_writer.writerow([self.frame_counter, -1, host_iso, png_path, h, w])
+                                    self._frame_index_writer.writerow([self.frame_counter, host_iso, png_path, h, w])
                                     self._frame_index_fp.flush()
                             
                             continue
             
             # 尝试解析自定义日志帧
             if self.enable_custom_log_frame:
-                log_result = self._parse_custom_log_frame(data)
-                if log_result is not None:
-                    ts_us, payload = log_result
+                payload = self._parse_custom_log_frame(data)
+                if payload is not None:
                     text_utf8 = ''
                     try:
                         text_utf8 = payload.decode('utf-8', errors='replace')
@@ -512,13 +722,13 @@ class UdpVideoReceiver:
                             host_iso,
                             'CUSTOM_LOG',
                             display_hex,
-                            f"Custom LOG ts={ts_us}us: {text_utf8[:50]}" + ('...' if len(text_utf8) > 50 else '')
+                            f"Custom LOG: {text_utf8[:50]}" + ('...' if len(text_utf8) > 50 else '')
                         ))
                         if len(self.recent_data) > self.max_recent_data:
                             self.recent_data.pop(0)
                     
                     if self._log_writer:
-                        self._log_writer.writerow([ts_us, host_iso, text_hex, text_utf8])
+                        self._log_writer.writerow([host_iso, text_hex, text_utf8])
                         self._log_csv_fp.flush()
                     
                     continue
@@ -571,7 +781,7 @@ class UdpVideoReceiver:
                         
                         # 记录到 CSV
                         if self._frame_index_writer:
-                            self._frame_index_writer.writerow([self.frame_counter, -1, host_iso, png_path, h, w])
+                            self._frame_index_writer.writerow([self.frame_counter, host_iso, png_path, h, w])
                             self._frame_index_fp.flush()
                 
                 elif ftype == FrameType.BINARY_IMAGE:
@@ -601,11 +811,11 @@ class UdpVideoReceiver:
                             cv2.imwrite(png_path, img)
                         
                         if self._frame_index_writer:
-                            self._frame_index_writer.writerow([self.frame_counter, -1, host_iso, png_path, h, w])
+                            self._frame_index_writer.writerow([self.frame_counter, host_iso, png_path, h, w])
                             self._frame_index_fp.flush()
                 
                 elif ftype == FrameType.LOG:
-                    ts_us, payload = parse_log_frame(data)
+                    payload = parse_log_frame(data)
                     text_utf8 = ''
                     try:
                         text_utf8 = payload.decode('utf-8', errors='replace')
@@ -624,13 +834,13 @@ class UdpVideoReceiver:
                             host_iso,
                             'LOG',
                             display_hex,
-                            f"LOG ts={ts_us}us: {text_utf8[:50]}" + ('...' if len(text_utf8) > 50 else '')
+                            f"LOG: {text_utf8[:50]}" + ('...' if len(text_utf8) > 50 else '')
                         ))
                         if len(self.recent_data) > self.max_recent_data:
                             self.recent_data.pop(0)
                     
                     if self._log_writer:
-                        self._log_writer.writerow([ts_us, host_iso, text_hex, text_utf8])
+                        self._log_writer.writerow([host_iso, text_hex, text_utf8])
                         self._log_csv_fp.flush()
                 else:
                     # 未知类型
@@ -674,9 +884,6 @@ class App(tb.Window if HAS_TTKBOOTSTRAP else tk.Tk):
 
         self.title('UDP 上位机 GUI')
         self.geometry('1200x800')
-
-        self.proc: subprocess.Popen | None = None
-        self.scope_proc: subprocess.Popen | None = None
         
         # UDP 视频接收器
         self.video_receiver: Optional[UdpVideoReceiver] = None
@@ -684,7 +891,7 @@ class App(tb.Window if HAS_TTKBOOTSTRAP else tk.Tk):
 
         # --- 参数 ---
         self.ip = tk.StringVar(value='0.0.0.0')
-        self.port = tk.IntVar(value=5005)
+        self.port = tk.IntVar(value=8080)
         self.show = tk.BooleanVar(value=True)
         self.save_png = tk.BooleanVar(value=False)
         self.png_dir = tk.StringVar(value=os.path.join(os.getcwd(), 'frames_png'))
@@ -710,6 +917,7 @@ class App(tb.Window if HAS_TTKBOOTSTRAP else tk.Tk):
         self.image_fixed_h = tk.IntVar(value=60)  # 固定高度 (STM32模式)
         self.image_fixed_w = tk.IntVar(value=120)  # 固定宽度 (STM32模式)
         self.image_size_mode = tk.StringVar(value='固定尺寸')  # 固定尺寸 / 动态解析
+        self.image_format = tk.StringVar(value='压缩二值(1位)')  # 图像数据编码格式
         
         # 自定义帧格式 - 日志帧
         self.enable_custom_log_frame = tk.BooleanVar(value=False)
@@ -804,7 +1012,6 @@ class App(tb.Window if HAS_TTKBOOTSTRAP else tk.Tk):
         nb.add(self._build_tab_align(), text='对齐')
         nb.add(self._build_tab_scope(), text='示波')
         nb.add(self._build_tab_custom_frame(), text='自定义帧')
-        nb.add(self._build_tab_test(), text='测试')
 
         # 输出区域（带滚动）
         self.out_text = self._scrolled_text(left_panel)
@@ -934,13 +1141,6 @@ class App(tb.Window if HAS_TTKBOOTSTRAP else tk.Tk):
             f.grid_columnconfigure(c, weight=1)
         return f
 
-    def _build_tab_test(self):
-        f = ttk.Frame()
-        row = 0
-        self._btn(f, text='启动测试服务端', command=self.start_test_host, bootstyle='info').grid(row=row, column=0, sticky='we', padx=6, pady=10)
-        self._btn(f, text='启动测试客户端', command=self.start_test_client, bootstyle='info').grid(row=row, column=1, sticky='we', padx=6, pady=10)
-        return f
-    
     def _build_tab_custom_frame(self):
         """构建自定义帧格式标签页"""
         f = ttk.Frame()
@@ -984,6 +1184,20 @@ class App(tb.Window if HAS_TTKBOOTSTRAP else tk.Tk):
         ttk.Label(f, text='帧尾 (Hex):', font=('Arial', 10, 'bold')).grid(row=row, column=0, sticky='e', padx=6, pady=6)
         ttk.Entry(f, textvariable=self.image_frame_footer, width=20, font=('Consolas', 10)).grid(row=row, column=1, sticky='w', padx=6)
         ttk.Label(f, text='可选', foreground='gray').grid(row=row, column=2, sticky='w', padx=6)
+        
+        row += 1
+        ttk.Separator(f, orient='horizontal').grid(row=row, column=0, columnspan=4, sticky='ew', pady=10)
+        
+        row += 1
+        ttk.Label(f, text='图像格式:', font=('Arial', 10, 'bold')).grid(row=row, column=0, sticky='e', padx=6, pady=6)
+        format_combo = ttk.Combobox(f, textvariable=self.image_format, width=18, state='readonly',
+                                     values=['灰度图(8位)', '二值图(8位)', '压缩二值(1位)', 
+                                             'RGB565', 'RGB888', 'BGR888', 'RGBA8888'])
+        format_combo.grid(row=row, column=1, sticky='w', padx=6)
+        
+        # 格式说明
+        format_info = ttk.Label(f, text='← 选择像素数据编码格式', foreground='gray', font=('Arial', 9))
+        format_info.grid(row=row, column=2, columnspan=2, sticky='w', padx=6)
         
         row += 1
         ttk.Separator(f, orient='horizontal').grid(row=row, column=0, columnspan=4, sticky='ew', pady=10)
@@ -1034,20 +1248,43 @@ class App(tb.Window if HAS_TTKBOOTSTRAP else tk.Tk):
 
 UDP协议格式: [帧头] [图像数据] [帧尾]
 
-【固定尺寸模式】(STM32默认)
-  图像数据: [纯像素数据 H×W字节]
-  - 不包含H/W字段，图像尺寸手动配置
-  - 示例(60x120): [A0FFFFA0] [7200字节像素] [B0B00A0D]
-  - 适用于: STM32 TR_Write_Image()
+【图像格式选项】
+系统支持多种像素数据编码格式:
 
-【动态解析模式】
-  图像数据: [H字段] [W字段] [像素数据 H×W字节]
-  - H/W字段可配置1-4字节，支持大端/小端
-  - 示例(1字节H/W, 60x120): [A0FFFFA0] [3C] [78] [7200字节像素] [B0B00A0D]
-  - 示例(2字节H/W小端, 320x240): [A0FFFFA0] [4001] [F000] [76800字节像素] [B0B00A0D]
+1. 压缩二值(1位) - 8:1压缩，适用于二值图像
+   • 8个像素压缩成1字节，MSB优先
+   • 数据量: H×W/8 字节
+   • 示例(60x120): [A0FFFFA0][900字节][B0B00A0D]
 
-STM32配置:
-  帧头=A0FFFFA0, 帧尾=B0B00A0D, 固定尺寸=60x120"""
+2. 二值图(8位) - 黑白图像，每像素1字节
+   • 0=黑色, 255=白色(自动阈值化)
+   • 数据量: H×W 字节
+
+3. 灰度图(8位) - 灰度图像，每像素1字节
+   • 0-255灰度值
+   • 数据量: H×W 字节
+
+4. RGB565 - 彩色图像，每像素2字节
+   • 5位R + 6位G + 5位B
+   • 数据量: H×W×2 字节
+   • 小端序存储
+
+5. RGB888 - 真彩色，每像素3字节
+   • 数据量: H×W×3 字节
+
+6. BGR888 - OpenCV格式，每像素3字节
+   • 数据量: H×W×3 字节
+
+7. RGBA8888 - 带透明通道，每像素4字节
+   • 数据量: H×W×4 字节
+
+【尺寸模式】
+• 固定尺寸: 图像数据=像素数据，H/W在配置中指定
+• 动态解析: 图像数据=[H字段][W字段][像素数据]
+
+STM32压缩示例(60x120):
+  帧头=A0FFFFA0, 帧尾=B0B00A0D
+  格式=压缩二值(1位), 固定尺寸=60x120"""
         
         help_text.insert('1.0', help_content)
         help_text.config(state='disabled')
@@ -1107,17 +1344,20 @@ STM32配置:
 UDP协议格式: [帧头] [日志数据] [帧尾]
 
 日志数据部分格式:
-  标准格式: [0x02] [LEN-1字节] [时间戳-8字节] [日志内容]
-    - LEN: 日志内容长度(不含类型/长度/时间戳)
-    - 时间戳: 64位微秒值(小端序)
-    - 示例: BB66 02 0E 1234567890ABCDEF [14字节日志] 0D0A
+  标准格式: [0x02] [LEN-1字节] [日志内容]
+    - LEN: 日志内容长度(不含类型/长度字段)
+    - 示例: BB66 02 0E [14字节日志] 0D0A
 
   纯文本格式: [文本内容]
-    - 直接发送文本，无需类型、长度、时间戳字段
-    - 系统将记录接收时间
+    - 直接发送文本，无需类型、长度字段
     - 示例: BB66 48656C6C6F ("Hello") 0D0A
 
-建议: 调试时使用纯文本格式更简单，正式使用时采用标准格式可记录精确时间"""
+时间戳说明:
+  • 系统自动记录上位机接收时间(精确到微秒)
+  • 所有数据按上位机时间戳对齐
+  • 无需下位机提供时间戳
+
+建议: 调试时使用纯文本格式更简单"""
         
         help_text.insert('1.0', help_content)
         help_text.config(state='disabled')
@@ -1165,30 +1405,133 @@ UDP协议格式: [帧头] [日志数据] [帧尾]
         return f
 
     def _build_tab_scope(self):
+        """构建示波器标签页"""
         f = ttk.Frame()
-        row = 0
-        ttk.Label(f, text='绑定 IP:').grid(row=row, column=0, sticky='e', padx=6, pady=6)
-        ttk.Entry(f, textvariable=self.ip, width=15).grid(row=row, column=1, sticky='w')
-
-        ttk.Label(f, text='端口:').grid(row=row, column=2, sticky='e')
-        ttk.Entry(f, textvariable=self.port, width=8).grid(row=row, column=3, sticky='w')
-
-        row += 1
-        ttk.Label(f, text='Byte 索引:').grid(row=row, column=0, sticky='e', padx=6)
-        ttk.Entry(f, textvariable=self.scope_index, width=8).grid(row=row, column=1, sticky='w')
-
-        ttk.Label(f, text='Bit (可空 0..7):').grid(row=row, column=2, sticky='e')
-        ttk.Entry(f, textvariable=self.scope_bit, width=8).grid(row=row, column=3, sticky='w')
-
-        row += 1
-        ttk.Label(f, text='最大点数:').grid(row=row, column=0, sticky='e', padx=6)
-        ttk.Entry(f, textvariable=self.scope_max_points, width=10).grid(row=row, column=1, sticky='w')
-
-        row += 1
-        self._btn(f, text='启动示波器', command=self.start_scope, bootstyle='success').grid(row=row, column=1, sticky='we', padx=6)
-        self._btn(f, text='停止示波器', command=self.stop_scope, bootstyle='danger').grid(row=row, column=2, sticky='we', padx=6)
-        for c in range(4):
-            f.grid_columnconfigure(c, weight=1)
+        
+        if not HAS_MATPLOTLIB:
+            ttk.Label(f, text='示波器不可用：需要安装 matplotlib\n\npip install matplotlib', 
+                     font=('Arial', 12), justify='center').pack(expand=True)
+            return f
+        
+        # 使用PanedWindow实现可调节分割
+        paned = ttk.PanedWindow(f, orient='vertical')
+        paned.pack(fill='both', expand=True, padx=4, pady=4)
+        
+        # 上部：图表区域（权重较大，可自适应缩放）
+        chart_frame = ttk.LabelFrame(paned, text='实时波形', padding=4)
+        
+        # 创建matplotlib图表 - 使用较小的固定尺寸，让canvas自适应
+        self.scope_fig = Figure(figsize=(8, 4), dpi=80)
+        self.scope_ax = self.scope_fig.add_subplot(111)
+        self.scope_ax.set_xlabel('时间 (秒)', fontsize=10)
+        self.scope_ax.set_ylabel('数值', fontsize=10)
+        self.scope_ax.set_title('数据示波器', fontsize=11, fontweight='bold')
+        self.scope_ax.grid(True, alpha=0.3, linestyle='--', linewidth=0.5)
+        
+        # 调整图表边距
+        self.scope_fig.tight_layout(pad=1.5)
+        
+        self.scope_canvas = FigureCanvasTkAgg(self.scope_fig, master=chart_frame)
+        self.scope_canvas.draw()
+        self.scope_canvas.get_tk_widget().pack(fill='both', expand=True)
+        
+        paned.add(chart_frame, weight=3)
+        
+        # 下部：控制面板（固定最小高度，带滚动条）
+        control_outer = ttk.Frame(paned)
+        
+        # 创建Canvas和Scrollbar用于滚动
+        canvas = tk.Canvas(control_outer, height=180, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(control_outer, orient='vertical', command=canvas.yview)
+        scrollable_frame = ttk.Frame(canvas)
+        
+        scrollable_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        
+        canvas.create_window((0, 0), window=scrollable_frame, anchor='nw')
+        canvas.configure(yscrollcommand=scrollbar.set)
+        
+        # 鼠标滚轮支持
+        def _on_mousewheel(event):
+            canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+        # 保存引用以便后续可能的清理
+        self._scope_mousewheel_handler = _on_mousewheel
+        canvas.bind_all("<MouseWheel>", _on_mousewheel)
+        
+        canvas.pack(side='left', fill='both', expand=True)
+        scrollbar.pack(side='right', fill='y')
+        
+        # 控制面板内容
+        control_frame = ttk.LabelFrame(scrollable_frame, text='示波器控制', padding=6)
+        control_frame.pack(fill='both', expand=True, padx=4, pady=4)
+        
+        # 第一行：变量管理（紧凑布局）
+        row1_frame = ttk.Frame(control_frame)
+        row1_frame.pack(fill='x', pady=2)
+        
+        ttk.Label(row1_frame, text='Byte:').pack(side='left', padx=(0, 2))
+        self.scope_byte_entry = ttk.Entry(row1_frame, width=6)
+        self.scope_byte_entry.pack(side='left', padx=2)
+        
+        ttk.Label(row1_frame, text='Bit:').pack(side='left', padx=(6, 2))
+        self.scope_bit_entry = ttk.Entry(row1_frame, width=4)
+        self.scope_bit_entry.pack(side='left', padx=2)
+        
+        ttk.Label(row1_frame, text='名称:').pack(side='left', padx=(6, 2))
+        self.scope_var_name = ttk.Entry(row1_frame, width=12)
+        self.scope_var_name.pack(side='left', padx=2)
+        
+        self._btn(row1_frame, text='添加', command=self._add_scope_variable, bootstyle='success').pack(side='left', padx=2)
+        self._btn(row1_frame, text='删除', command=self._remove_scope_variable, bootstyle='danger').pack(side='left', padx=2)
+        self._btn(row1_frame, text='清空', command=self._clear_scope_variables, bootstyle='secondary').pack(side='left', padx=2)
+        
+        # 第二行：变量列表
+        row2_frame = ttk.Frame(control_frame)
+        row2_frame.pack(fill='x', pady=2)
+        
+        ttk.Label(row2_frame, text='监控变量:').pack(side='top', anchor='w')
+        
+        list_frame = ttk.Frame(row2_frame)
+        list_frame.pack(fill='x', pady=2)
+        
+        self.scope_var_listbox = tk.Listbox(list_frame, height=2, font=('Consolas', 8))
+        self.scope_var_listbox.pack(side='left', fill='both', expand=True)
+        
+        list_scrollbar = ttk.Scrollbar(list_frame, orient='vertical', command=self.scope_var_listbox.yview)
+        list_scrollbar.pack(side='left', fill='y')
+        self.scope_var_listbox.config(yscrollcommand=list_scrollbar.set)
+        
+        # 第三行：显示设置（水平排列）
+        row3_frame = ttk.Frame(control_frame)
+        row3_frame.pack(fill='x', pady=2)
+        
+        ttk.Label(row3_frame, text='时间窗口:').pack(side='left', padx=(0, 2))
+        self.scope_time_window = tk.DoubleVar(value=10.0)
+        ttk.Spinbox(row3_frame, textvariable=self.scope_time_window, from_=1, to=60, width=6, increment=1).pack(side='left', padx=2)
+        ttk.Label(row3_frame, text='秒').pack(side='left', padx=(0, 8))
+        
+        ttk.Label(row3_frame, text='刷新率:').pack(side='left', padx=(0, 2))
+        self.scope_refresh_rate = tk.IntVar(value=10)
+        ttk.Spinbox(row3_frame, textvariable=self.scope_refresh_rate, from_=1, to=60, width=6, increment=5).pack(side='left', padx=2)
+        ttk.Label(row3_frame, text='Hz').pack(side='left', padx=(0, 8))
+        
+        self.scope_auto_scale = tk.BooleanVar(value=True)
+        ttk.Checkbutton(row3_frame, text='自动缩放', variable=self.scope_auto_scale).pack(side='left', padx=4)
+        
+        self._btn(row3_frame, text='清除数据', command=self._clear_scope_data, bootstyle='warning').pack(side='left', padx=4)
+        
+        paned.add(control_outer, weight=1)
+        
+        # 初始化示波器数据结构
+        self.scope_variables = []  # [(byte_idx, bit_idx, name, color), ...]
+        self.scope_colors = ['#FF6B6B', '#4ECDC4', '#FFD93D', '#A66FFF', '#6BCF7F', '#FF9F43', '#4A90E2', '#FF6FA3']
+        self.scope_color_idx = 0
+        
+        # 启动更新线程
+        self._scope_update_job = None
+        
         return f
 
     # ---------------- 事件处理 ----------------
@@ -1201,6 +1544,10 @@ UDP协议格式: [帧头] [日志数据] [帧尾]
         # 停止视频更新
         if self._video_update_job:
             self.after_cancel(self._video_update_job)
+        
+        # 停止示波器更新
+        if hasattr(self, '_scope_update_job') and self._scope_update_job:
+            self.after_cancel(self._scope_update_job)
         
         self.destroy()
     
@@ -1679,14 +2026,6 @@ UDP协议格式: [帧头] [日志数据] [帧尾]
         if fpath:
             self.video_out.set(fpath)
 
-    def start_test_host(self):
-        self._log('启动测试服务端: ' + ' '.join([sys.executable, 'test_udp_host.py']))
-        subprocess.Popen([sys.executable, 'test_udp_host.py'], cwd=SCRIPT_DIR)
-
-    def start_test_client(self):
-        self._log('启动测试客户端: ' + ' '.join([sys.executable, 'test_udp_client.py']))
-        subprocess.Popen([sys.executable, 'test_udp_client.py'], cwd=SCRIPT_DIR)
-
     def start_run(self):
         """启动 UDP 监听（内嵌模式）"""
         if self.video_receiver and self.video_receiver._running:
@@ -1738,6 +2077,7 @@ UDP协议格式: [帧头] [日志数据] [帧尾]
             image_w_order=self.image_w_order.get(),
             image_fixed_h=fixed_h,
             image_fixed_w=fixed_w,
+            image_format=self.image_format.get(),
             enable_custom_log_frame=self.enable_custom_log_frame.get(),
             log_frame_header=self.log_frame_header.get(),
             log_frame_footer=self.log_frame_footer.get(),
@@ -1797,37 +2137,189 @@ UDP协议格式: [帧头] [日志数据] [帧尾]
         self._log('执行对齐: ' + ' '.join(args))
         subprocess.Popen(args, cwd=SCRIPT_DIR)
 
-    def start_scope(self):
-        if self.scope_proc and self.scope_proc.poll() is None:
-            messagebox.showwarning('提示', '示波器已在运行')
+    def _add_scope_variable(self):
+        """添加示波器监控变量"""
+        if not HAS_MATPLOTLIB:
             return
-        bit = self.scope_bit.get().strip()
-        args = [
-            sys.executable, MAIN_SCRIPT, 'scope',
-            '--ip', self.ip.get(), '--port', str(self.port.get()),
-            '--index', str(self.scope_index.get()), '--max-points', str(self.scope_max_points.get()),
-        ]
-        if bit != '':
-            args += ['--bit', bit]
-        self._log('启动示波器: ' + ' '.join(args))
-        self.scope_proc = subprocess.Popen(args, cwd=SCRIPT_DIR)
-
-    def stop_scope(self):
-        if self.scope_proc and self.scope_proc.poll() is None:
-            self._log('停止示波器...')
-            self.scope_proc.terminate()
-            threading.Thread(target=self._wait_kill_scope, daemon=True).start()
-        else:
-            messagebox.showinfo('提示', '示波器未运行')
-    
-    def _wait_kill_scope(self):
-        """等待并强制结束示波器进程"""
-        if self.scope_proc:
+        
+        try:
+            byte_idx = int(self.scope_byte_entry.get())
+        except ValueError:
+            messagebox.showerror('错误', 'Byte索引必须是整数')
+            return
+        
+        bit_str = self.scope_bit_entry.get().strip()
+        bit_idx = None
+        if bit_str:
             try:
-                self.scope_proc.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                self._log('强制结束示波器进程')
-                self.scope_proc.kill()
+                bit_idx = int(bit_str)
+                if bit_idx < 0 or bit_idx > 7:
+                    messagebox.showerror('错误', 'Bit索引必须在0-7之间')
+                    return
+            except ValueError:
+                messagebox.showerror('错误', 'Bit索引必须是整数')
+                return
+        
+        name = self.scope_var_name.get().strip()
+        if not name:
+            if bit_idx is not None:
+                name = f"Byte[{byte_idx}].Bit[{bit_idx}]"
+            else:
+                name = f"Byte[{byte_idx}]"
+        
+        # 检查是否已存在
+        for var in self.scope_variables:
+            if var[0] == byte_idx and var[1] == bit_idx:
+                messagebox.showwarning('警告', '该变量已存在')
+                return
+        
+        # 分配颜色
+        color = self.scope_colors[self.scope_color_idx % len(self.scope_colors)]
+        self.scope_color_idx += 1
+        
+        # 添加变量
+        self.scope_variables.append((byte_idx, bit_idx, name, color))
+        
+        # 更新列表显示
+        bit_text = f".Bit[{bit_idx}]" if bit_idx is not None else ""
+        self.scope_var_listbox.insert('end', f"● {name}  (Byte[{byte_idx}]{bit_text})  —  {color}")
+        self.scope_var_listbox.itemconfig('end', foreground=color)
+        
+        # 初始化数据存储
+        if self.video_receiver and self.video_receiver._running:
+            with self.video_receiver.scope_lock:
+                key = (byte_idx, bit_idx)
+                if key not in self.video_receiver.scope_data:
+                    from collections import deque
+                    self.video_receiver.scope_data[key] = deque(maxlen=10000)
+        
+        self._log(f'✓ 添加监控变量: {name}')
+        
+        # 清空输入
+        self.scope_byte_entry.delete(0, 'end')
+        self.scope_bit_entry.delete(0, 'end')
+        self.scope_var_name.delete(0, 'end')
+        
+        # 启动更新
+        if not self._scope_update_job:
+            self._start_scope_update()
+    
+    def _remove_scope_variable(self):
+        """删除选中的监控变量"""
+        selection = self.scope_var_listbox.curselection()
+        if not selection:
+            return
+        
+        idx = selection[0]
+        var = self.scope_variables[idx]
+        
+        # 从列表删除
+        self.scope_variables.pop(idx)
+        self.scope_var_listbox.delete(idx)
+        
+        # 从数据存储删除
+        if self.video_receiver:
+            with self.video_receiver.scope_lock:
+                key = (var[0], var[1])
+                if key in self.video_receiver.scope_data:
+                    del self.video_receiver.scope_data[key]
+        
+        self._log(f'✓ 删除监控变量: {var[2]}')
+    
+    def _clear_scope_variables(self):
+        """清空所有监控变量"""
+        self.scope_variables.clear()
+        self.scope_var_listbox.delete(0, 'end')
+        
+        if self.video_receiver:
+            with self.video_receiver.scope_lock:
+                self.video_receiver.scope_data.clear()
+        
+        self._log('✓ 清空所有监控变量')
+    
+    def _clear_scope_data(self):
+        """清除示波器数据"""
+        if self.video_receiver:
+            with self.video_receiver.scope_lock:
+                for key in self.video_receiver.scope_data:
+                    self.video_receiver.scope_data[key].clear()
+                self.video_receiver.scope_start_time = time.time()
+        
+        self._log('✓ 清除示波器数据')
+    
+    def _start_scope_update(self):
+        """启动示波器更新"""
+        if not HAS_MATPLOTLIB:
+            return
+        
+        self._update_scope_chart()
+    
+    def _update_scope_chart(self):
+        """更新示波器图表"""
+        if not HAS_MATPLOTLIB or not self.video_receiver or not self.video_receiver._running:
+            self._scope_update_job = None
+            return
+        
+        try:
+            # 清空图表
+            self.scope_ax.clear()
+            self.scope_ax.set_xlabel('时间 (秒)', fontsize=10)
+            self.scope_ax.set_ylabel('数值', fontsize=10)
+            self.scope_ax.set_title('数据示波器', fontsize=12, fontweight='bold')
+            self.scope_ax.grid(True, alpha=0.3)
+            
+            # 获取时间窗口
+            time_window = self.scope_time_window.get()
+            current_time = time.time()
+            start_time = self.video_receiver.scope_start_time
+            
+            # 绘制每个变量
+            has_data = False
+            with self.video_receiver.scope_lock:
+                for byte_idx, bit_idx, name, color in self.scope_variables:
+                    key = (byte_idx, bit_idx)
+                    if key not in self.video_receiver.scope_data:
+                        continue
+                    
+                    data = self.video_receiver.scope_data[key]
+                    if not data:
+                        continue
+                    
+                    # 过滤时间窗口内的数据
+                    times = []
+                    values = []
+                    for timestamp, value in data:
+                        rel_time = timestamp - start_time
+                        if current_time - timestamp <= time_window:
+                            times.append(rel_time)
+                            values.append(value)
+                    
+                    if times:
+                        self.scope_ax.plot(times, values, label=name, color=color, linewidth=1.5, marker='o', markersize=3)
+                        has_data = True
+            
+            if has_data:
+                self.scope_ax.legend(loc='upper right', fontsize=9)
+                
+                # 设置Y轴范围
+                if not self.scope_auto_scale.get():
+                    self.scope_ax.set_ylim(-10, 270)
+            else:
+                self.scope_ax.text(0.5, 0.5, '等待数据...', 
+                                  horizontalalignment='center', verticalalignment='center',
+                                  transform=self.scope_ax.transAxes, fontsize=14, color='gray')
+            
+            # 刷新画布
+            self.scope_canvas.draw()
+            
+        except Exception as e:
+            print(f"[ERROR] Scope update error: {e}")
+        
+        # 继续更新
+        refresh_interval = int(1000 / self.scope_refresh_rate.get())
+        self._scope_update_job = self.after(refresh_interval, self._update_scope_chart)
+    
+
 
 
 def main():

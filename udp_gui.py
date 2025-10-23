@@ -53,6 +53,23 @@ except ImportError:
     HAS_CV2 = False
     print("[WARN] OpenCV or PIL not available, video display disabled")
 
+
+# 获取本机所有 IP 地址
+def get_local_ips():
+    """获取本机所有可用的 IP 地址"""
+    ips = ['0.0.0.0', '127.0.0.1']  # 默认选项
+    try:
+        hostname = socket.gethostname()
+        # 获取所有 IP 地址
+        for info in socket.getaddrinfo(hostname, None):
+            ip = info[4][0]
+            if ':' not in ip:  # 只保留 IPv4
+                if ip not in ips:
+                    ips.append(ip)
+    except Exception as e:
+        print(f"[WARN] Failed to get local IPs: {e}")
+    return ips
+
 # Switch 控件（仅在较新 ttkbootstrap 中提供）
 Switch = getattr(tb, 'Switch', None) if HAS_TTKBOOTSTRAP else None
 
@@ -130,13 +147,43 @@ class UdpVideoReceiver:
     def __init__(self, ip: str, port: int, save_png: bool = False, 
                  png_dir: str = 'frames_png',
                  log_csv: str = 'logs.csv',
-                 frame_index_csv: str = 'frames_index.csv'):
+                 frame_index_csv: str = 'frames_index.csv',
+                 enable_custom_image_frame: bool = False,
+                 image_frame_header: str = '',
+                 image_frame_footer: str = '',
+                 image_h_bytes: int = 1,
+                 image_w_bytes: int = 1,
+                 image_h_order: str = '小端',
+                 image_w_order: str = '小端',
+                 image_fixed_h: int = 0,  # 固定高度 (0表示从数据解析)
+                 image_fixed_w: int = 0,  # 固定宽度 (0表示从数据解析)
+                 enable_custom_log_frame: bool = False,
+                 log_frame_header: str = '',
+                 log_frame_footer: str = '',
+                 log_frame_format: str = '标准格式'):
         self.ip = ip
         self.port = port
         self.save_png = save_png
         self.png_dir = png_dir
         self.log_csv = log_csv
         self.frame_index_csv = frame_index_csv
+        
+        # 自定义图像帧格式
+        self.enable_custom_image_frame = enable_custom_image_frame
+        self.image_frame_header_bytes = bytes.fromhex(image_frame_header.replace(' ', '')) if image_frame_header else b''
+        self.image_frame_footer_bytes = bytes.fromhex(image_frame_footer.replace(' ', '')) if image_frame_footer else b''
+        self.image_h_bytes = image_h_bytes
+        self.image_w_bytes = image_w_bytes
+        self.image_h_order = image_h_order
+        self.image_w_order = image_w_order
+        self.image_fixed_h = image_fixed_h
+        self.image_fixed_w = image_fixed_w
+        
+        # 自定义日志帧格式
+        self.enable_custom_log_frame = enable_custom_log_frame
+        self.log_frame_header_bytes = bytes.fromhex(log_frame_header.replace(' ', '')) if log_frame_header else b''
+        self.log_frame_footer_bytes = bytes.fromhex(log_frame_footer.replace(' ', '')) if log_frame_footer else b''
+        self.log_frame_format = log_frame_format
         
         self._sock: Optional[socket.socket] = None
         self._thread: Optional[threading.Thread] = None
@@ -250,9 +297,150 @@ class UdpVideoReceiver:
             self._fps_frame_count = 0
             self._fps_timer = time.time()
     
+    def _parse_custom_frame(self, data: bytes) -> Optional[bytes]:
+        """解析自定义帧格式，返回帧数据（不含帧头帧尾）"""
+        if not self.enable_custom_image_frame or not self.image_frame_header_bytes:
+            return None
+        
+        # 查找帧头
+        header_pos = data.find(self.image_frame_header_bytes)
+        if header_pos == -1:
+            return None
+        
+        # 提取数据起始位置
+        data_start = header_pos + len(self.image_frame_header_bytes)
+        
+        # 如果有帧尾，查找帧尾
+        if self.image_frame_footer_bytes:
+            footer_pos = data.find(self.image_frame_footer_bytes, data_start)
+            if footer_pos == -1:
+                return None
+            frame_data = data[data_start:footer_pos]
+        else:
+            # 没有帧尾，提取到末尾
+            frame_data = data[data_start:]
+        
+        # 验证最小长度
+        if len(frame_data) < 3:
+            return None
+        
+        return frame_data
+    
+    def _parse_custom_log_frame(self, data: bytes) -> Optional[tuple]:
+        """解析自定义日志帧格式，返回 (timestamp_us, payload)"""
+        if not self.enable_custom_log_frame or not self.log_frame_header_bytes:
+            return None
+        
+        # 查找帧头
+        header_pos = data.find(self.log_frame_header_bytes)
+        if header_pos == -1:
+            return None
+        
+        # 提取数据起始位置
+        data_start = header_pos + len(self.log_frame_header_bytes)
+        
+        # 如果有帧尾，查找帧尾
+        if self.log_frame_footer_bytes:
+            footer_pos = data.find(self.log_frame_footer_bytes, data_start)
+            if footer_pos == -1:
+                return None
+            frame_data = data[data_start:footer_pos]
+        else:
+            # 没有帧尾，提取到末尾
+            frame_data = data[data_start:]
+        
+        if len(frame_data) < 1:
+            return None
+        
+        # 根据格式解析
+        if self.log_frame_format == '标准格式':
+            # 标准格式: [0x02][LEN][TS_8bytes][payload]
+            if len(frame_data) < 10:  # 至少需要 1+1+8
+                return None
+            try:
+                return parse_log_frame(frame_data)
+            except:
+                return None
+        else:  # 纯文本
+            # 纯文本格式，没有时间戳
+            return (-1, frame_data)
+    
+    def _parse_custom_image_data(self, data: bytes) -> Optional[Tuple[int, int, np.ndarray]]:
+        """根据自定义格式解析图像数据
+        
+        支持两种模式:
+        1. 固定尺寸模式: 图像数据只包含像素，H/W通过配置指定
+           格式: [像素数据 H×W字节]
+        
+        2. 动态尺寸模式: 图像数据包含H/W字段
+           格式: [H-N字节][W-M字节][像素数据 H×W字节]
+        
+        注意: data参数已经去除了帧头和帧尾，只包含图像数据部分
+        """
+        if not HAS_CV2:
+            return None
+        
+        try:
+            # 模式1: 固定尺寸 (STM32模式)
+            if self.image_fixed_h > 0 and self.image_fixed_w > 0:
+                h = self.image_fixed_h
+                w = self.image_fixed_w
+                expected_pixels = h * w
+                
+                if len(data) < expected_pixels:
+                    print(f"[WARN] Fixed size mode: expected {expected_pixels} bytes, got {len(data)}")
+                    return None
+                
+                pixels = np.frombuffer(data[:expected_pixels], dtype=np.uint8)
+                img = pixels.reshape((h, w))
+                
+                return h, w, img
+            
+            # 模式2: 动态尺寸 (包含H/W字段)
+            else:
+                idx = 0
+                
+                # 解析高度 (H字段)
+                if len(data) < self.image_h_bytes + self.image_w_bytes:
+                    return None
+                
+                h_bytes = data[idx:idx+self.image_h_bytes]
+                if self.image_h_order == '大端':
+                    h = int.from_bytes(h_bytes, 'big')
+                else:
+                    h = int.from_bytes(h_bytes, 'little')
+                idx += self.image_h_bytes
+                
+                # 解析宽度 (W字段)
+                w_bytes = data[idx:idx+self.image_w_bytes]
+                if self.image_w_order == '大端':
+                    w = int.from_bytes(w_bytes, 'big')
+                else:
+                    w = int.from_bytes(w_bytes, 'little')
+                idx += self.image_w_bytes
+                
+                # 解析像素数据
+                expected_pixels = h * w
+                if len(data) < idx + expected_pixels:
+                    print(f"[WARN] Dynamic size mode: expected {idx + expected_pixels}, got {len(data)}")
+                    return None
+                
+                pixels = np.frombuffer(data[idx:idx+expected_pixels], dtype=np.uint8)
+                img = pixels.reshape((h, w))
+                
+                return h, w, img
+            
+        except Exception as e:
+            print(f"[ERROR] Custom image parse error: {e}")
+            return None
+    
     def _receive_loop(self):
         """接收循环（在后台线程运行）"""
         print(f"[INFO] UDP receiver started on {self.ip}:{self.port}")
+        if self.enable_custom_image_frame:
+            print(f"[INFO] Custom image frame enabled: header={self.image_frame_header_bytes.hex()}, footer={self.image_frame_footer_bytes.hex() if self.image_frame_footer_bytes else 'None'}")
+        if self.enable_custom_log_frame:
+            print(f"[INFO] Custom log frame enabled: header={self.log_frame_header_bytes.hex()}, footer={self.log_frame_footer_bytes.hex() if self.log_frame_footer_bytes else 'None'}")
         
         while not self._stop_event.is_set():
             try:
@@ -270,6 +458,86 @@ class UdpVideoReceiver:
             if not data:
                 continue
             
+            # 尝试解析自定义图像帧
+            if self.enable_custom_image_frame:
+                custom_image_data = self._parse_custom_frame(data)
+                if custom_image_data is not None:
+                    result = self._parse_custom_image_data(custom_image_data)
+                    if result is not None:
+                        h, w, img = result
+                        if img is not None:
+                            self.frame_counter += 1
+                            self._update_fps()
+                            
+                            with self.frame_lock:
+                                self.current_frame = img.copy()
+                            
+                            with self.data_lock:
+                                self.recent_data.append((
+                                    host_iso,
+                                    'CUSTOM_IMAGE',
+                                    data[:100].hex() + ('...' if len(data) > 100 else ''),
+                                    f"Custom Image Frame {self.frame_counter}: {w}x{h}, {len(data)} bytes total"
+                                ))
+                                if len(self.recent_data) > self.max_recent_data:
+                                    self.recent_data.pop(0)
+                            
+                            if self.save_png:
+                                png_path = os.path.join(self.png_dir, f"frame_{self.frame_counter:06d}.png")
+                                cv2.imwrite(png_path, img)
+                                if self._frame_index_writer:
+                                    self._frame_index_writer.writerow([self.frame_counter, -1, host_iso, png_path, h, w])
+                                    self._frame_index_fp.flush()
+                            
+                            continue
+            
+            # 尝试解析自定义日志帧
+            if self.enable_custom_log_frame:
+                log_result = self._parse_custom_log_frame(data)
+                if log_result is not None:
+                    ts_us, payload = log_result
+                    text_utf8 = ''
+                    try:
+                        text_utf8 = payload.decode('utf-8', errors='replace')
+                    except:
+                        pass
+                    text_hex = payload.hex()
+                    
+                    with self.data_lock:
+                        display_hex = data.hex()
+                        if len(display_hex) > 500:
+                            display_hex = display_hex[:500] + '...'
+                        
+                        self.recent_data.append((
+                            host_iso,
+                            'CUSTOM_LOG',
+                            display_hex,
+                            f"Custom LOG ts={ts_us}us: {text_utf8[:50]}" + ('...' if len(text_utf8) > 50 else '')
+                        ))
+                        if len(self.recent_data) > self.max_recent_data:
+                            self.recent_data.pop(0)
+                    
+                    if self._log_writer:
+                        self._log_writer.writerow([ts_us, host_iso, text_hex, text_utf8])
+                        self._log_csv_fp.flush()
+                    
+                    continue
+            
+            # 如果启用了自定义帧但无法解析，记录错误
+            if self.enable_custom_image_frame or self.enable_custom_log_frame:
+                self.error_packets += 1
+                with self.data_lock:
+                    self.recent_data.append((
+                        host_iso,
+                        'INVALID_CUSTOM',
+                        data[:200].hex() + ('...' if len(data) > 200 else ''),
+                        f"Failed to parse custom frame: {len(data)} bytes"
+                    ))
+                    if len(self.recent_data) > self.max_recent_data:
+                        self.recent_data.pop(0)
+                continue
+            
+            # 默认帧格式处理
             ftype = data[0]
             
             try:
@@ -430,6 +698,24 @@ class App(tb.Window if HAS_TTKBOOTSTRAP else tk.Tk):
         self.scope_index = tk.IntVar(value=0)
         self.scope_bit = tk.StringVar(value='')  # 允许空，或 0..7
         self.scope_max_points = tk.IntVar(value=2000)
+        
+        # 自定义帧格式 - 图像帧
+        self.enable_custom_image_frame = tk.BooleanVar(value=False)
+        self.image_frame_header = tk.StringVar(value='A0FFFFA0')  # 默认使用STM32帧头
+        self.image_frame_footer = tk.StringVar(value='B0B00A0D')  # 默认使用STM32帧尾
+        self.image_h_bytes = tk.IntVar(value=1)  # H 字段字节数 (动态模式)
+        self.image_w_bytes = tk.IntVar(value=1)  # W 字段字节数 (动态模式)
+        self.image_h_order = tk.StringVar(value='小端')  # 字节序
+        self.image_w_order = tk.StringVar(value='小端')
+        self.image_fixed_h = tk.IntVar(value=60)  # 固定高度 (STM32模式)
+        self.image_fixed_w = tk.IntVar(value=120)  # 固定宽度 (STM32模式)
+        self.image_size_mode = tk.StringVar(value='固定尺寸')  # 固定尺寸 / 动态解析
+        
+        # 自定义帧格式 - 日志帧
+        self.enable_custom_log_frame = tk.BooleanVar(value=False)
+        self.log_frame_header = tk.StringVar(value='BB66')
+        self.log_frame_footer = tk.StringVar(value='')
+        self.log_frame_format = tk.StringVar(value='标准格式')  # 标准格式 / 纯文本
 
     # 已移除 C 扩展处理选项（ctypes），保持 GUI 简洁
 
@@ -517,6 +803,7 @@ class App(tb.Window if HAS_TTKBOOTSTRAP else tk.Tk):
         nb.add(self._build_tab_video(), text='视频')
         nb.add(self._build_tab_align(), text='对齐')
         nb.add(self._build_tab_scope(), text='示波')
+        nb.add(self._build_tab_custom_frame(), text='自定义帧')
         nb.add(self._build_tab_test(), text='测试')
 
         # 输出区域（带滚动）
@@ -604,10 +891,15 @@ class App(tb.Window if HAS_TTKBOOTSTRAP else tk.Tk):
 
         row = 0
         ttk.Label(f, text='绑定 IP:').grid(row=row, column=0, sticky='e', padx=6, pady=6)
-        ttk.Entry(f, textvariable=self.ip, width=15).grid(row=row, column=1, sticky='w')
+        
+        # 使用 Combobox 显示可用的 IP 地址
+        ip_combo = ttk.Combobox(f, textvariable=self.ip, width=15, values=get_local_ips())
+        ip_combo.grid(row=row, column=1, sticky='w')
+        
+        self._btn(f, text='刷新IP', command=self._refresh_ips, bootstyle='secondary-outline').grid(row=row, column=2, sticky='w', padx=2)
 
-        ttk.Label(f, text='端口:').grid(row=row, column=2, sticky='e')
-        ttk.Entry(f, textvariable=self.port, width=8).grid(row=row, column=3, sticky='w')
+        ttk.Label(f, text='端口:').grid(row=row, column=3, sticky='e')
+        ttk.Entry(f, textvariable=self.port, width=8).grid(row=row, column=4, sticky='w')
 
         row += 1
         # 移除 show 开关（因为现在始终在主窗口显示）
@@ -621,24 +913,24 @@ class App(tb.Window if HAS_TTKBOOTSTRAP else tk.Tk):
 
         row += 1
         ttk.Label(f, text='PNG 目录:').grid(row=row, column=0, sticky='e', padx=6)
-        ttk.Entry(f, textvariable=self.png_dir, width=48).grid(row=row, column=1, columnspan=2, sticky='we')
-        self._btn(f, text='选择', command=self._pick_png_dir, bootstyle='secondary-outline').grid(row=row, column=3, sticky='w')
+        ttk.Entry(f, textvariable=self.png_dir, width=48).grid(row=row, column=1, columnspan=3, sticky='we')
+        self._btn(f, text='选择', command=self._pick_png_dir, bootstyle='secondary-outline').grid(row=row, column=4, sticky='w')
 
         row += 1
         ttk.Label(f, text='日志 CSV:').grid(row=row, column=0, sticky='e', padx=6)
-        ttk.Entry(f, textvariable=self.log_csv, width=48).grid(row=row, column=1, columnspan=2, sticky='we')
-        self._btn(f, text='选择', command=self._pick_log_csv, bootstyle='secondary-outline').grid(row=row, column=3, sticky='w')
+        ttk.Entry(f, textvariable=self.log_csv, width=48).grid(row=row, column=1, columnspan=3, sticky='we')
+        self._btn(f, text='选择', command=self._pick_log_csv, bootstyle='secondary-outline').grid(row=row, column=4, sticky='w')
 
         row += 1
         ttk.Label(f, text='帧索引 CSV:').grid(row=row, column=0, sticky='e', padx=6)
-        ttk.Entry(f, textvariable=self.frame_index_csv, width=48).grid(row=row, column=1, columnspan=2, sticky='we')
-        self._btn(f, text='选择', command=self._pick_frame_csv, bootstyle='secondary-outline').grid(row=row, column=3, sticky='w')
+        ttk.Entry(f, textvariable=self.frame_index_csv, width=48).grid(row=row, column=1, columnspan=3, sticky='we')
+        self._btn(f, text='选择', command=self._pick_frame_csv, bootstyle='secondary-outline').grid(row=row, column=4, sticky='w')
 
         row += 1
-        self._btn(f, text='启动监听', command=self.start_run, bootstyle='success').grid(row=row, column=1, sticky='we', padx=6, pady=10)
-        self._btn(f, text='停止监听', command=self.stop_run, bootstyle='danger').grid(row=row, column=2, sticky='we', padx=6, pady=10)
+        self._btn(f, text='启动监听', command=self.start_run, bootstyle='success').grid(row=row, column=1, columnspan=2, sticky='we', padx=6, pady=10)
+        self._btn(f, text='停止监听', command=self.stop_run, bootstyle='danger').grid(row=row, column=3, columnspan=2, sticky='we', padx=6, pady=10)
 
-        for c in range(4):
+        for c in range(5):
             f.grid_columnconfigure(c, weight=1)
         return f
 
@@ -647,6 +939,195 @@ class App(tb.Window if HAS_TTKBOOTSTRAP else tk.Tk):
         row = 0
         self._btn(f, text='启动测试服务端', command=self.start_test_host, bootstyle='info').grid(row=row, column=0, sticky='we', padx=6, pady=10)
         self._btn(f, text='启动测试客户端', command=self.start_test_client, bootstyle='info').grid(row=row, column=1, sticky='we', padx=6, pady=10)
+        return f
+    
+    def _build_tab_custom_frame(self):
+        """构建自定义帧格式标签页"""
+        f = ttk.Frame()
+        
+        # 创建Notebook用于分页
+        custom_nb = self._nb(f)
+        custom_nb.pack(fill='both', expand=True, padx=6, pady=6)
+        
+        # 图像帧配置页
+        image_tab = self._build_custom_image_frame_tab()
+        custom_nb.add(image_tab, text='图像帧配置')
+        
+        # 日志帧配置页
+        log_tab = self._build_custom_log_frame_tab()
+        custom_nb.add(log_tab, text='日志帧配置')
+        
+        return f
+    
+    def _build_custom_image_frame_tab(self):
+        """构建图像帧自定义配置"""
+        f = ttk.Frame()
+        
+        row = 0
+        self._add_switch(
+            f,
+            text='启用图像帧自定义格式',
+            var=self.enable_custom_image_frame,
+            bootstyle='success',
+            grid_kwargs=dict(row=row, column=0, columnspan=4, sticky='w', padx=6, pady=10),
+        )
+        
+        row += 1
+        ttk.Separator(f, orient='horizontal').grid(row=row, column=0, columnspan=4, sticky='ew', pady=10)
+        
+        row += 1
+        ttk.Label(f, text='帧头 (Hex):', font=('Arial', 10, 'bold')).grid(row=row, column=0, sticky='e', padx=6, pady=6)
+        ttk.Entry(f, textvariable=self.image_frame_header, width=20, font=('Consolas', 10)).grid(row=row, column=1, sticky='w', padx=6)
+        ttk.Label(f, text='例: AA55', foreground='gray').grid(row=row, column=2, sticky='w', padx=6)
+        
+        row += 1
+        ttk.Label(f, text='帧尾 (Hex):', font=('Arial', 10, 'bold')).grid(row=row, column=0, sticky='e', padx=6, pady=6)
+        ttk.Entry(f, textvariable=self.image_frame_footer, width=20, font=('Consolas', 10)).grid(row=row, column=1, sticky='w', padx=6)
+        ttk.Label(f, text='可选', foreground='gray').grid(row=row, column=2, sticky='w', padx=6)
+        
+        row += 1
+        ttk.Separator(f, orient='horizontal').grid(row=row, column=0, columnspan=4, sticky='ew', pady=10)
+        
+        row += 1
+        ttk.Label(f, text='尺寸解析模式:', font=('Arial', 10, 'bold')).grid(row=row, column=0, sticky='e', padx=6, pady=6)
+        mode_combo = ttk.Combobox(f, textvariable=self.image_size_mode, width=18, state='readonly',
+                                   values=['固定尺寸', '动态解析'])
+        mode_combo.grid(row=row, column=1, sticky='w', padx=6)
+        mode_combo.bind('<<ComboboxSelected>>', self._on_image_size_mode_changed)
+        
+        # 固定尺寸配置 (STM32模式) - row_fixed
+        self.row_fixed = row + 1
+        self.fixed_size_label = ttk.Label(f, text='图像尺寸:', font=('Arial', 10))
+        
+        self.fixed_frame = ttk.Frame(f)
+        ttk.Label(self.fixed_frame, text='H:').pack(side='left')
+        ttk.Spinbox(self.fixed_frame, textvariable=self.image_fixed_h, from_=1, to=1024, width=6).pack(side='left', padx=2)
+        ttk.Label(self.fixed_frame, text='W:').pack(side='left', padx=(10,0))
+        ttk.Spinbox(self.fixed_frame, textvariable=self.image_fixed_w, from_=1, to=1024, width=6).pack(side='left', padx=2)
+        
+        # 动态解析配置 - row_dynamic_h, row_dynamic_w
+        self.row_dynamic_h = row + 1
+        self.dynamic_h_label = ttk.Label(f, text='H 字段:', font=('Arial', 10))
+        self.dynamic_h_spinbox = ttk.Spinbox(f, textvariable=self.image_h_bytes, from_=1, to=4, width=8)
+        self.dynamic_h_byte_label = ttk.Label(f, text='字节')
+        self.dynamic_h_combo = ttk.Combobox(f, textvariable=self.image_h_order, width=8, state='readonly', 
+                                             values=['小端', '大端'])
+        
+        self.row_dynamic_w = row + 2
+        self.dynamic_w_label = ttk.Label(f, text='W 字段:', font=('Arial', 10))
+        self.dynamic_w_spinbox = ttk.Spinbox(f, textvariable=self.image_w_bytes, from_=1, to=4, width=8)
+        self.dynamic_w_byte_label = ttk.Label(f, text='字节')
+        self.dynamic_w_combo = ttk.Combobox(f, textvariable=self.image_w_order, width=8, state='readonly',
+                                             values=['小端', '大端'])
+        
+        # 初始显示固定尺寸模式
+        self._update_image_size_mode_ui()
+        
+        row += 3  # 预留3行空间
+        ttk.Separator(f, orient='horizontal').grid(row=row, column=0, columnspan=4, sticky='ew', pady=10)
+        
+        row += 1
+        help_text = tk.Text(f, height=8, width=70, wrap='word', font=('Arial', 9))
+        help_text.grid(row=row, column=0, columnspan=4, sticky='we', padx=6, pady=6)
+        
+        help_content = """图像帧格式说明：
+
+UDP协议格式: [帧头] [图像数据] [帧尾]
+
+【固定尺寸模式】(STM32默认)
+  图像数据: [纯像素数据 H×W字节]
+  - 不包含H/W字段，图像尺寸手动配置
+  - 示例(60x120): [A0FFFFA0] [7200字节像素] [B0B00A0D]
+  - 适用于: STM32 TR_Write_Image()
+
+【动态解析模式】
+  图像数据: [H字段] [W字段] [像素数据 H×W字节]
+  - H/W字段可配置1-4字节，支持大端/小端
+  - 示例(1字节H/W, 60x120): [A0FFFFA0] [3C] [78] [7200字节像素] [B0B00A0D]
+  - 示例(2字节H/W小端, 320x240): [A0FFFFA0] [4001] [F000] [76800字节像素] [B0B00A0D]
+
+STM32配置:
+  帧头=A0FFFFA0, 帧尾=B0B00A0D, 固定尺寸=60x120"""
+        
+        help_text.insert('1.0', help_content)
+        help_text.config(state='disabled')
+        
+        row += 1
+        self._btn(f, text='验证图像帧配置', command=self._validate_image_frame, bootstyle='info').grid(row=row, column=1, sticky='we', padx=6, pady=10)
+        
+        for c in range(4):
+            f.grid_columnconfigure(c, weight=1)
+        
+        return f
+    
+    def _build_custom_log_frame_tab(self):
+        """构建日志帧自定义配置"""
+        f = ttk.Frame()
+        
+        row = 0
+        self._add_switch(
+            f,
+            text='启用日志帧自定义格式',
+            var=self.enable_custom_log_frame,
+            bootstyle='success',
+            grid_kwargs=dict(row=row, column=0, columnspan=4, sticky='w', padx=6, pady=10),
+        )
+        
+        row += 1
+        ttk.Separator(f, orient='horizontal').grid(row=row, column=0, columnspan=4, sticky='ew', pady=10)
+        
+        row += 1
+        ttk.Label(f, text='帧头 (Hex):', font=('Arial', 10, 'bold')).grid(row=row, column=0, sticky='e', padx=6, pady=6)
+        ttk.Entry(f, textvariable=self.log_frame_header, width=20, font=('Consolas', 10)).grid(row=row, column=1, sticky='w', padx=6)
+        ttk.Label(f, text='例: BB66', foreground='gray').grid(row=row, column=2, sticky='w', padx=6)
+        
+        row += 1
+        ttk.Label(f, text='帧尾 (Hex):', font=('Arial', 10, 'bold')).grid(row=row, column=0, sticky='e', padx=6, pady=6)
+        ttk.Entry(f, textvariable=self.log_frame_footer, width=20, font=('Consolas', 10)).grid(row=row, column=1, sticky='w', padx=6)
+        ttk.Label(f, text='可选', foreground='gray').grid(row=row, column=2, sticky='w', padx=6)
+        
+        row += 1
+        ttk.Separator(f, orient='horizontal').grid(row=row, column=0, columnspan=4, sticky='ew', pady=10)
+        
+        row += 1
+        ttk.Label(f, text='数据格式:', font=('Arial', 10, 'bold')).grid(row=row, column=0, sticky='e', padx=6, pady=6)
+        format_combo = ttk.Combobox(f, textvariable=self.log_frame_format, width=18, state='readonly',
+                                     values=['标准格式', '纯文本'])
+        format_combo.grid(row=row, column=1, sticky='w', padx=6)
+        
+        row += 1
+        ttk.Separator(f, orient='horizontal').grid(row=row, column=0, columnspan=4, sticky='ew', pady=10)
+        
+        row += 1
+        help_text = tk.Text(f, height=10, width=70, wrap='word', font=('Arial', 9))
+        help_text.grid(row=row, column=0, columnspan=4, sticky='we', padx=6, pady=6)
+        
+        help_content = """日志帧格式说明：
+
+UDP协议格式: [帧头] [日志数据] [帧尾]
+
+日志数据部分格式:
+  标准格式: [0x02] [LEN-1字节] [时间戳-8字节] [日志内容]
+    - LEN: 日志内容长度(不含类型/长度/时间戳)
+    - 时间戳: 64位微秒值(小端序)
+    - 示例: BB66 02 0E 1234567890ABCDEF [14字节日志] 0D0A
+
+  纯文本格式: [文本内容]
+    - 直接发送文本，无需类型、长度、时间戳字段
+    - 系统将记录接收时间
+    - 示例: BB66 48656C6C6F ("Hello") 0D0A
+
+建议: 调试时使用纯文本格式更简单，正式使用时采用标准格式可记录精确时间"""
+        
+        help_text.insert('1.0', help_content)
+        help_text.config(state='disabled')
+        
+        row += 1
+        self._btn(f, text='验证日志帧配置', command=self._validate_log_frame, bootstyle='info').grid(row=row, column=1, sticky='we', padx=6, pady=10)
+        
+        for c in range(4):
+            f.grid_columnconfigure(c, weight=1)
+        
         return f
 
     def _build_tab_video(self):
@@ -958,6 +1439,235 @@ class App(tb.Window if HAS_TTKBOOTSTRAP else tk.Tk):
         fpath = filedialog.asksaveasfilename(defaultextension='.csv', filetypes=[('CSV', '*.csv'), ('All', '*.*')])
         if fpath:
             self.frame_index_csv.set(fpath)
+    
+    def _refresh_ips(self):
+        """刷新可用的 IP 地址列表"""
+        ips = get_local_ips()
+        # 找到 IP 输入框并更新其值列表
+        for widget in self.winfo_children():
+            self._update_ip_combobox(widget, ips)
+        self._log(f'已刷新 IP 列表: {", ".join(ips)}')
+    
+    def _update_ip_combobox(self, widget, ips):
+        """递归查找并更新 IP Combobox"""
+        if isinstance(widget, ttk.Combobox) and widget['textvariable'] == str(self.ip):
+            widget['values'] = ips
+            return
+        for child in widget.winfo_children():
+            self._update_ip_combobox(child, ips)
+    
+    def _validate_custom_frame(self):
+        """验证自定义帧配置"""
+        try:
+            # 验证帧头
+            header = self.frame_header.get().replace(' ', '').strip()
+            if not header:
+                messagebox.showerror('验证失败', '帧头不能为空！')
+                return
+            
+            # 尝试转换为字节
+            try:
+                header_bytes = bytes.fromhex(header)
+            except ValueError:
+                messagebox.showerror('验证失败', f'帧头格式错误："{header}"\n请使用有效的十六进制字符（0-9, A-F）')
+                return
+            
+            # 验证帧尾（可选）
+            footer = self.frame_footer.get().replace(' ', '').strip()
+            footer_bytes = None
+            if footer:
+                try:
+                    footer_bytes = bytes.fromhex(footer)
+                except ValueError:
+                    messagebox.showerror('验证失败', f'帧尾格式错误："{footer}"\n请使用有效的十六进制字符（0-9, A-F）')
+                    return
+            
+            # 验证最小长度
+            min_len = self.frame_min_length.get()
+            if min_len < 1:
+                messagebox.showerror('验证失败', '最小帧长度必须大于 0')
+                return
+            
+            # 显示验证结果
+            result = f"✓ 配置验证通过！\n\n"
+            result += f"帧头：{header} ({len(header_bytes)} 字节)\n"
+            result += f"  二进制：{' '.join(f'{b:08b}' for b in header_bytes)}\n"
+            result += f"  ASCII： {' '.join(chr(b) if 32 <= b < 127 else '·' for b in header_bytes)}\n\n"
+            
+            if footer_bytes:
+                result += f"帧尾：{footer} ({len(footer_bytes)} 字节)\n"
+                result += f"  二进制：{' '.join(f'{b:08b}' for b in footer_bytes)}\n"
+                result += f"  ASCII： {' '.join(chr(b) if 32 <= b < 127 else '·' for b in footer_bytes)}\n\n"
+            else:
+                result += f"帧尾：<无>\n\n"
+            
+            result += f"最小帧长度：{min_len} 字节\n\n"
+            result += f"帧格式示例：\n"
+            result += f"  [{header}] [数据...] " + (f"[{footer}]" if footer else "") + "\n\n"
+            result += f"建议：启用前请先使用默认模式测试，\n确认数据正常后再切换到自定义格式。"
+            
+            messagebox.showinfo('验证通过', result)
+            self._log(f'✓ 自定义帧配置验证通过: 帧头={header}, 帧尾={footer if footer else "无"}')
+            
+        except Exception as e:
+            messagebox.showerror('验证失败', f'验证过程出错：{str(e)}')
+    
+    def _reset_custom_frame(self):
+        """恢复默认配置"""
+        self.enable_custom_frame.set(False)
+        self.frame_header.set('AA55')
+        self.frame_footer.set('')
+        self.frame_min_length.set(3)
+        self._log('✓ 已恢复自定义帧默认配置')
+        messagebox.showinfo('提示', '已恢复默认配置')
+    
+    def _on_image_size_mode_changed(self, event=None):
+        """图像尺寸模式切换回调"""
+        self._update_image_size_mode_ui()
+    
+    def _update_image_size_mode_ui(self):
+        """根据尺寸模式更新UI显示"""
+        mode = self.image_size_mode.get()
+        
+        if mode == '固定尺寸':
+            # 显示固定尺寸配置
+            self.fixed_size_label.grid(row=self.row_fixed, column=0, sticky='e', padx=6, pady=6)
+            self.fixed_frame.grid(row=self.row_fixed, column=1, columnspan=2, sticky='w', padx=6)
+            
+            # 隐藏动态解析配置
+            self.dynamic_h_label.grid_remove()
+            self.dynamic_h_spinbox.grid_remove()
+            self.dynamic_h_byte_label.grid_remove()
+            self.dynamic_h_combo.grid_remove()
+            self.dynamic_w_label.grid_remove()
+            self.dynamic_w_spinbox.grid_remove()
+            self.dynamic_w_byte_label.grid_remove()
+            self.dynamic_w_combo.grid_remove()
+        else:  # 动态解析
+            # 隐藏固定尺寸配置
+            self.fixed_size_label.grid_remove()
+            self.fixed_frame.grid_remove()
+            
+            # 显示动态解析配置
+            self.dynamic_h_label.grid(row=self.row_dynamic_h, column=0, sticky='e', padx=6, pady=6)
+            self.dynamic_h_spinbox.grid(row=self.row_dynamic_h, column=1, sticky='w', padx=(6,2))
+            self.dynamic_h_byte_label.grid(row=self.row_dynamic_h, column=1, sticky='w', padx=(80, 0))
+            self.dynamic_h_combo.grid(row=self.row_dynamic_h, column=2, sticky='w', padx=6)
+            
+            self.dynamic_w_label.grid(row=self.row_dynamic_w, column=0, sticky='e', padx=6, pady=6)
+            self.dynamic_w_spinbox.grid(row=self.row_dynamic_w, column=1, sticky='w', padx=(6,2))
+            self.dynamic_w_byte_label.grid(row=self.row_dynamic_w, column=1, sticky='w', padx=(80, 0))
+            self.dynamic_w_combo.grid(row=self.row_dynamic_w, column=2, sticky='w', padx=6)
+    
+    def _validate_image_frame(self):
+        """验证图像帧配置"""
+        header = self.image_frame_header.get().replace(' ', '').strip().upper()
+        footer = self.image_frame_footer.get().replace(' ', '').strip().upper()
+        
+        errors = []
+        
+        if not header:
+            errors.append("帧头不能为空")
+        else:
+            try:
+                bytes.fromhex(header)
+            except ValueError:
+                errors.append(f"帧头格式错误: {header}")
+        
+        if footer:
+            try:
+                bytes.fromhex(footer)
+            except ValueError:
+                errors.append(f"帧尾格式错误: {footer}")
+        
+        h_bytes = self.image_h_bytes.get()
+        w_bytes = self.image_w_bytes.get()
+        
+        if h_bytes < 1 or h_bytes > 4:
+            errors.append("H字段字节数必须在1-4之间")
+        if w_bytes < 1 or w_bytes > 4:
+            errors.append("W字段字节数必须在1-4之间")
+        
+        if errors:
+            msg = "配置错误:\n" + "\n".join(f"• {e}" for e in errors)
+            messagebox.showerror("图像帧配置错误", msg)
+        else:
+            info = f"✓ 图像帧配置有效!\n\n"
+            info += f"协议格式: [帧头][图像数据][帧尾]\n\n"
+            info += f"帧头: {header} ({len(bytes.fromhex(header))} 字节)\n"
+            if footer:
+                info += f"帧尾: {footer} ({len(bytes.fromhex(footer))} 字节)\n"
+            else:
+                info += f"帧尾: (无)\n"
+            info += f"\n图像数据格式:\n"
+            info += f"  H字段: {h_bytes}字节 ({self.image_h_order.get()})\n"
+            info += f"  W字段: {w_bytes}字节 ({self.image_w_order.get()})\n"
+            info += f"  像素数据: H×W 字节\n"
+            
+            # 生成示例
+            info += f"\n示例 (64x48图像):\n"
+            if h_bytes == 1:
+                h_hex = "40"
+            elif h_bytes == 2:
+                h_hex = '4000' if self.image_h_order.get()=='小端' else '0040'
+            elif h_bytes == 4:
+                h_hex = '40000000' if self.image_h_order.get()=='小端' else '00000040'
+            else:
+                h_hex = "..."
+            
+            if w_bytes == 1:
+                w_hex = "30"
+            elif w_bytes == 2:
+                w_hex = '3000' if self.image_w_order.get()=='小端' else '0030'
+            elif w_bytes == 4:
+                w_hex = '30000000' if self.image_w_order.get()=='小端' else '00000030'
+            else:
+                w_hex = "..."
+            
+            info += f"  UDP包: {header} {h_hex} {w_hex} [3072字节像素] {footer if footer else ''}"
+            
+            messagebox.showinfo("图像帧配置验证", info)
+    
+    def _validate_log_frame(self):
+        """验证日志帧配置"""
+        header = self.log_frame_header.get().replace(' ', '').strip().upper()
+        footer = self.log_frame_footer.get().replace(' ', '').strip().upper()
+        
+        errors = []
+        
+        if not header:
+            errors.append("帧头不能为空")
+        else:
+            try:
+                bytes.fromhex(header)
+            except ValueError:
+                errors.append(f"帧头格式错误: {header}")
+        
+        if footer:
+            try:
+                bytes.fromhex(footer)
+            except ValueError:
+                errors.append(f"帧尾格式错误: {footer}")
+        
+        if errors:
+            msg = "配置错误:\n" + "\n".join(f"• {e}" for e in errors)
+            messagebox.showerror("日志帧配置错误", msg)
+        else:
+            format_type = self.log_frame_format.get()
+            info = f"日志帧配置有效!\n\n"
+            info += f"帧头: {header} ({len(bytes.fromhex(header))} 字节)\n"
+            if footer:
+                info += f"帧尾: {footer} ({len(bytes.fromhex(footer))} 字节)\n"
+            else:
+                info += f"帧尾: (无)\n"
+            info += f"数据格式: {format_type}\n"
+            
+            if format_type == '标准格式':
+                info += "\n标准格式包含: [0x02][长度][时间戳8字节][内容]"
+            else:
+                info += "\n纯文本格式直接发送文本，系统自动记录接收时间"
+            
+            messagebox.showinfo("日志帧配置验证", info)
 
     def _pick_video_png_dir(self):
         d = filedialog.askdirectory()
@@ -987,22 +1697,70 @@ class App(tb.Window if HAS_TTKBOOTSTRAP else tk.Tk):
             messagebox.showerror('错误', '未安装 OpenCV，无法显示视频\n请运行: pip install opencv-python pillow')
             return
         
+        # 验证 IP 地址
+        bind_ip = self.ip.get()
+        if bind_ip not in ['0.0.0.0', '127.0.0.1']:
+            # 检查是否是本机 IP
+            local_ips = get_local_ips()
+            if bind_ip not in local_ips:
+                result = messagebox.askyesno(
+                    '警告：IP 地址可能无效',
+                    f'IP 地址 "{bind_ip}" 不在本机 IP 列表中！\n\n'
+                    f'本机可用的 IP 地址：\n{chr(10).join(local_ips)}\n\n'
+                    f'建议使用 "0.0.0.0" 监听所有网络接口。\n\n'
+                    f'是否仍然尝试使用 "{bind_ip}"？'
+                )
+                if not result:
+                    return
+        
         # 创建并启动接收器
+        # 根据模式选择固定尺寸或动态解析
+        if self.image_size_mode.get() == '固定尺寸':
+            fixed_h = self.image_fixed_h.get()
+            fixed_w = self.image_fixed_w.get()
+        else:
+            fixed_h = 0  # 0表示动态解析
+            fixed_w = 0
+        
         self.video_receiver = UdpVideoReceiver(
-            ip=self.ip.get(),
+            ip=bind_ip,
             port=self.port.get(),
             save_png=self.save_png.get(),
             png_dir=self.png_dir.get(),
             log_csv=self.log_csv.get(),
-            frame_index_csv=self.frame_index_csv.get()
+            frame_index_csv=self.frame_index_csv.get(),
+            enable_custom_image_frame=self.enable_custom_image_frame.get(),
+            image_frame_header=self.image_frame_header.get(),
+            image_frame_footer=self.image_frame_footer.get(),
+            image_h_bytes=self.image_h_bytes.get(),
+            image_w_bytes=self.image_w_bytes.get(),
+            image_h_order=self.image_h_order.get(),
+            image_w_order=self.image_w_order.get(),
+            image_fixed_h=fixed_h,
+            image_fixed_w=fixed_w,
+            enable_custom_log_frame=self.enable_custom_log_frame.get(),
+            log_frame_header=self.log_frame_header.get(),
+            log_frame_footer=self.log_frame_footer.get(),
+            log_frame_format=self.log_frame_format.get(),
         )
         
         if self.video_receiver.start():
-            self._log(f'启动监听: {self.ip.get()}:{self.port.get()}')
+            self._log(f'✓ 启动监听成功: {bind_ip}:{self.port.get()}')
+            if bind_ip == '0.0.0.0':
+                self._log(f'  监听所有网络接口，可从任何本机 IP 接收数据')
             # 启动视频显示更新
             self._update_video_display()
         else:
-            messagebox.showerror('错误', '启动 UDP 监听失败')
+            error_msg = '启动 UDP 监听失败！\n\n'
+            error_msg += '常见原因：\n'
+            error_msg += f'1. IP 地址 "{bind_ip}" 不是本机 IP\n'
+            error_msg += f'2. 端口 {self.port.get()} 已被占用\n'
+            error_msg += '3. 防火墙阻止了连接\n\n'
+            error_msg += '建议：\n'
+            error_msg += '• 使用 "0.0.0.0" 监听所有接口\n'
+            error_msg += '• 检查防火墙设置\n'
+            error_msg += '• 尝试更换端口号'
+            messagebox.showerror('启动失败', error_msg)
             self.video_receiver = None
 
     def stop_run(self):

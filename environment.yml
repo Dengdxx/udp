@@ -1,0 +1,12 @@
+name: smartcar-udp-host
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - numpy  # conda-forge/Anaconda 提供的官方构建，避免 mingw 变体
+  - opencv  # conda 版本自带依赖，避免 pip 的轮子冲突
+  - matplotlib
+  - pip
+  - pip:
+      - pillow  # 可选，若后续需要

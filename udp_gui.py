@@ -53,6 +53,33 @@ except ImportError:
     HAS_CV2 = False
     print("[WARN] OpenCV or PIL not available, video display disabled")
 
+# ---------------------- 辅助函数 ----------------------
+
+def sanitize_csv_text(text: str) -> str:
+    """清理CSV文本,移除会导致读取问题的特殊字符
+    
+    Args:
+        text: 原始文本
+    
+    Returns:
+        清理后的文本,移除NULL、EOF等特殊字符
+    """
+    if not text:
+        return text
+    
+    # 移除NULL字符(0x00)和EOF字符(0x1A)
+    # 这些字符会导致C++的std::getline提前终止
+    text = text.replace('\x00', '')  # NULL
+    text = text.replace('\x1A', '')  # EOF/SUB (Ctrl+Z)
+    
+    # 可选:也移除其他控制字符(保留换行、制表等常用字符)
+    # 移除 0x01-0x08, 0x0B-0x0C, 0x0E-0x1F (保留 \t=0x09, \n=0x0A, \r=0x0D)
+    cleaned = ''.join(c for c in text if ord(c) >= 0x20 or c in '\t\n\r')
+    
+    return cleaned
+
+# ---------------------- 辅助函数(继续) ----------------------
+
 # 导入matplotlib用于示波器
 try:
     import matplotlib
@@ -843,6 +870,8 @@ class UdpVideoReceiver:
                     text_utf8 = ''
                     try:
                         text_utf8 = payload.decode('utf-8', errors='replace')
+                        # 清理特殊字符,避免CSV读取问题
+                        text_utf8 = sanitize_csv_text(text_utf8)
                     except:
                         pass
                     text_hex = payload.hex()
@@ -967,6 +996,8 @@ class UdpVideoReceiver:
                     text_utf8 = ''
                     try:
                         text_utf8 = payload.decode('utf-8', errors='replace')
+                        # 清理特殊字符,避免CSV读取问题
+                        text_utf8 = sanitize_csv_text(text_utf8)
                     except:
                         pass
                     text_hex = payload.hex()

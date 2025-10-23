@@ -339,7 +339,9 @@ class UdpVideoReceiver:
                  enable_custom_log_frame: bool = False,
                  log_frame_header: str = '',
                  log_frame_footer: str = '',
-                 log_frame_format: str = '标准格式'):
+                 log_frame_format: str = '标准格式',
+                 log_callback = None,  # 添加日志回调
+                 log_variables = None):  # 日志变量配置列表
         self.ip = ip
         self.port = port
         self.save_png = save_png
@@ -364,6 +366,12 @@ class UdpVideoReceiver:
         self.log_frame_header_bytes = bytes.fromhex(log_frame_header.replace(' ', '')) if log_frame_header else b''
         self.log_frame_footer_bytes = bytes.fromhex(log_frame_footer.replace(' ', '')) if log_frame_footer else b''
         self.log_frame_format = log_frame_format
+        
+        # 日志回调函数
+        self.log_callback = log_callback
+        
+        # 日志变量配置 [(name, byte_pos, data_type, display_format), ...]
+        self.log_variables = log_variables if log_variables else []
         
         self._sock: Optional[socket.socket] = None
         self._thread: Optional[threading.Thread] = None
@@ -417,7 +425,12 @@ class UdpVideoReceiver:
             self._log_csv_fp = open(self.log_csv, 'a', newline='', encoding='utf-8')
             self._log_writer = csv.writer(self._log_csv_fp)
             if not log_csv_exists:
-                self._log_writer.writerow(["host_recv_iso", "log_text_hex", "log_text_utf8"])
+                # 构建动态CSV表头
+                csv_header = ["host_recv_iso", "log_text_hex", "log_text_utf8"]
+                # 添加配置的日志变量列
+                for var_name, _, _, _ in self.log_variables:
+                    csv_header.append(var_name)
+                self._log_writer.writerow(csv_header)
             
             frame_csv_exists = os.path.exists(self.frame_index_csv) and os.path.getsize(self.frame_index_csv) > 0
             self._frame_index_fp = open(self.frame_index_csv, 'a', newline='', encoding='utf-8')
@@ -512,6 +525,127 @@ class UdpVideoReceiver:
         return frame_data
     
     def _parse_custom_log_frame(self, data: bytes) -> Optional[bytes]:
+        """解析自定义日志帧格式，返回 payload"""
+        if not self.enable_custom_log_frame or not self.log_frame_header_bytes:
+            return None
+        
+        # 查找帧头
+        header_pos = data.find(self.log_frame_header_bytes)
+        if header_pos == -1:
+            return None
+        
+        # 提取数据起始位置
+        data_start = header_pos + len(self.log_frame_header_bytes)
+        
+        # 如果有帧尾，查找帧尾
+        if self.log_frame_footer_bytes:
+            footer_pos = data.find(self.log_frame_footer_bytes, data_start)
+            if footer_pos == -1:
+                return None
+            frame_data = data[data_start:footer_pos]
+        else:
+            # 没有帧尾，提取到末尾
+            frame_data = data[data_start:]
+        
+        if len(frame_data) < 1:
+            return None
+        
+        # 根据格式解析
+        if self.log_frame_format == '标准格式':
+            # 标准格式: [0x02][LEN][payload]
+            if len(frame_data) < 2:  # 至少需要 1+1
+                return None
+            try:
+                return parse_log_frame(frame_data)
+            except:
+                return None
+        else:  # 纯文本
+            # 纯文本格式，直接返回内容
+            return frame_data
+    
+    def _parse_log_variables(self, payload: bytes) -> dict:
+        """从日志payload中解析所有配置的变量
+        
+        Args:
+            payload: 日志数据payload
+            
+        Returns:
+            字典 {变量名: 值}
+        """
+        result = {}
+        for var_name, byte_pos, data_type, _ in self.log_variables:
+            try:
+                value = self._parse_single_log_value(payload, byte_pos, data_type)
+                result[var_name] = value if value is not None else ''
+            except Exception:
+                result[var_name] = ''
+        return result
+    
+    def _parse_single_log_value(self, data: bytes, byte_pos: int, data_type: str):
+        """从日志数据中解析指定位置的值
+        
+        Args:
+            data: 日志数据
+            byte_pos: 字节位置
+            data_type: 数据类型
+            
+        Returns:
+            解析后的值，如果失败返回 None
+        """
+        if byte_pos >= len(data):
+            return None
+        
+        try:
+            if data_type == 'uint8':
+                return data[byte_pos]
+            elif data_type == 'int8':
+                return struct.unpack_from('b', data, byte_pos)[0]
+            elif data_type == 'uint16_le':
+                if byte_pos + 1 >= len(data):
+                    return None
+                return struct.unpack_from('<H', data, byte_pos)[0]
+            elif data_type == 'uint16_be':
+                if byte_pos + 1 >= len(data):
+                    return None
+                return struct.unpack_from('>H', data, byte_pos)[0]
+            elif data_type == 'int16_le':
+                if byte_pos + 1 >= len(data):
+                    return None
+                return struct.unpack_from('<h', data, byte_pos)[0]
+            elif data_type == 'int16_be':
+                if byte_pos + 1 >= len(data):
+                    return None
+                return struct.unpack_from('>h', data, byte_pos)[0]
+            elif data_type == 'uint32_le':
+                if byte_pos + 3 >= len(data):
+                    return None
+                return struct.unpack_from('<I', data, byte_pos)[0]
+            elif data_type == 'uint32_be':
+                if byte_pos + 3 >= len(data):
+                    return None
+                return struct.unpack_from('>I', data, byte_pos)[0]
+            elif data_type == 'int32_le':
+                if byte_pos + 3 >= len(data):
+                    return None
+                return struct.unpack_from('<i', data, byte_pos)[0]
+            elif data_type == 'int32_be':
+                if byte_pos + 3 >= len(data):
+                    return None
+                return struct.unpack_from('>i', data, byte_pos)[0]
+            elif data_type == 'float_le':
+                if byte_pos + 3 >= len(data):
+                    return None
+                return struct.unpack_from('<f', data, byte_pos)[0]
+            elif data_type == 'float_be':
+                if byte_pos + 3 >= len(data):
+                    return None
+                return struct.unpack_from('>f', data, byte_pos)[0]
+            else:
+                return None
+        except Exception:
+            return None
+    
+    def _parse_custom_log_frame_OLD(self, data: bytes) -> Optional[bytes]:
         """解析自定义日志帧格式，返回 payload"""
         if not self.enable_custom_log_frame or not self.log_frame_header_bytes:
             return None
@@ -727,9 +861,23 @@ class UdpVideoReceiver:
                         if len(self.recent_data) > self.max_recent_data:
                             self.recent_data.pop(0)
                     
+                    # 写入CSV（包含解析的变量值）
                     if self._log_writer:
-                        self._log_writer.writerow([host_iso, text_hex, text_utf8])
+                        # 构建CSV行数据
+                        row_data = [host_iso, text_hex, text_utf8]
+                        # 解析所有配置的变量并添加到行数据
+                        log_vars = self._parse_log_variables(payload)
+                        for var_name, _, _, _ in self.log_variables:
+                            row_data.append(log_vars.get(var_name, ''))
+                        self._log_writer.writerow(row_data)
                         self._log_csv_fp.flush()
+                    
+                    # 调用日志回调（用于实时显示）
+                    if self.log_callback:
+                        try:
+                            self.log_callback(payload)
+                        except Exception as e:
+                            print(f"[ERROR] Log callback error: {e}")
                     
                     continue
             
@@ -839,9 +987,23 @@ class UdpVideoReceiver:
                         if len(self.recent_data) > self.max_recent_data:
                             self.recent_data.pop(0)
                     
+                    # 写入CSV（包含解析的变量值）
                     if self._log_writer:
-                        self._log_writer.writerow([host_iso, text_hex, text_utf8])
+                        # 构建CSV行数据
+                        row_data = [host_iso, text_hex, text_utf8]
+                        # 解析所有配置的变量并添加到行数据
+                        log_vars = self._parse_log_variables(payload)
+                        for var_name, _, _, _ in self.log_variables:
+                            row_data.append(log_vars.get(var_name, ''))
+                        self._log_writer.writerow(row_data)
                         self._log_csv_fp.flush()
+                    
+                    # 调用日志回调（用于实时显示）
+                    if self.log_callback:
+                        try:
+                            self.log_callback(payload)
+                        except Exception as e:
+                            print(f"[ERROR] Log callback error: {e}")
                 else:
                     # 未知类型
                     self.error_packets += 1
@@ -1037,6 +1199,18 @@ class App(tb.Window if HAS_TTKBOOTSTRAP else tk.Tk):
         self.stats_label = ttk.Label(stats_frame, text='等待视频流...', font=('Consolas', 9))
         self.stats_label.pack()
         
+        # 实时日志显示区域
+        log_display_frame = ttk.LabelFrame(right_panel, text='实时日志显示', padding=10)
+        log_display_frame.pack(fill='both', expand=False, padx=8, pady=(4, 4))
+        
+        # 日志显示画布（用于动态创建标签）
+        self.log_canvas = tk.Canvas(log_display_frame, height=100, bg='#1e1e1e', highlightthickness=0)
+        self.log_canvas.pack(fill='both', expand=True)
+        
+        # 日志数据容器
+        self.log_labels = {}  # {var_name: label_widget}
+        self.log_values = {}  # {var_name: current_value}
+        
         # 原始数据显示区域
         data_frame = ttk.LabelFrame(right_panel, text='原始数据监视器', padding=10)
         data_frame.pack(fill='both', expand=False, padx=8, pady=(4, 8))
@@ -1156,6 +1330,10 @@ class App(tb.Window if HAS_TTKBOOTSTRAP else tk.Tk):
         # 日志帧配置页
         log_tab = self._build_custom_log_frame_tab()
         custom_nb.add(log_tab, text='日志帧配置')
+        
+        # 日志变量配置页
+        log_vars_tab = self._build_log_variables_tab()
+        custom_nb.add(log_vars_tab, text='日志变量配置')
         
         return f
     
@@ -1367,6 +1545,92 @@ UDP协议格式: [帧头] [日志数据] [帧尾]
         
         for c in range(4):
             f.grid_columnconfigure(c, weight=1)
+        
+        return f
+    
+    def _build_log_variables_tab(self):
+        """构建日志变量配置标签页"""
+        f = ttk.Frame()
+        
+        # 说明
+        info_frame = ttk.Frame(f)
+        info_frame.pack(fill='x', padx=6, pady=6)
+        
+        info_label = ttk.Label(info_frame, text='配置日志变量以实时显示。支持从日志数据包中提取指定字节位置的值。', 
+                                font=('Arial', 9), foreground='gray')
+        info_label.pack(anchor='w')
+        
+        ttk.Separator(f, orient='horizontal').pack(fill='x', pady=10)
+        
+        # 添加变量区域
+        add_frame = ttk.LabelFrame(f, text='添加日志变量', padding=10)
+        add_frame.pack(fill='x', padx=6, pady=6)
+        
+        row = 0
+        ttk.Label(add_frame, text='变量名称:', font=('Arial', 10)).grid(row=row, column=0, sticky='e', padx=6, pady=6)
+        self.log_var_name_entry = ttk.Entry(add_frame, width=20)
+        self.log_var_name_entry.grid(row=row, column=1, sticky='w', padx=6)
+        ttk.Label(add_frame, text='例: 温度、速度', foreground='gray').grid(row=row, column=2, sticky='w', padx=6)
+        
+        row += 1
+        ttk.Label(add_frame, text='字节位置:', font=('Arial', 10)).grid(row=row, column=0, sticky='e', padx=6, pady=6)
+        self.log_var_byte_pos = tk.IntVar(value=0)
+        ttk.Spinbox(add_frame, textvariable=self.log_var_byte_pos, from_=0, to=255, width=8).grid(row=row, column=1, sticky='w', padx=6)
+        ttk.Label(add_frame, text='从0开始的字节索引', foreground='gray').grid(row=row, column=2, sticky='w', padx=6)
+        
+        row += 1
+        ttk.Label(add_frame, text='数据类型:', font=('Arial', 10)).grid(row=row, column=0, sticky='e', padx=6, pady=6)
+        self.log_var_data_type = tk.StringVar(value='uint8')
+        type_combo = ttk.Combobox(add_frame, textvariable=self.log_var_data_type, width=18, state='readonly',
+                                   values=['uint8', 'int8', 'uint16_le', 'uint16_be', 'int16_le', 'int16_be',
+                                           'uint32_le', 'uint32_be', 'int32_le', 'int32_be', 'float_le', 'float_be'])
+        type_combo.grid(row=row, column=1, sticky='w', padx=6)
+        
+        row += 1
+        ttk.Label(add_frame, text='显示格式:', font=('Arial', 10)).grid(row=row, column=0, sticky='e', padx=6, pady=6)
+        self.log_var_display_format = tk.StringVar(value='{value}')
+        format_combo = ttk.Combobox(add_frame, textvariable=self.log_var_display_format, width=18,
+                                     values=['{value}', '{value:.2f}', '0x{value:02X}', '0x{value:04X}', '{value}°C', '{value}%'])
+        format_combo.grid(row=row, column=1, sticky='w', padx=6)
+        ttk.Label(add_frame, text='使用Python格式化语法', foreground='gray').grid(row=row, column=2, sticky='w', padx=6)
+        
+        row += 1
+        btn_frame = ttk.Frame(add_frame)
+        btn_frame.grid(row=row, column=1, columnspan=2, sticky='w', padx=6, pady=10)
+        self._btn(btn_frame, text='添加变量', command=self._add_log_variable, bootstyle='success').pack(side='left', padx=2)
+        self._btn(btn_frame, text='清空所有', command=self._clear_log_variables, bootstyle='warning').pack(side='left', padx=2)
+        
+        # 变量列表区域
+        list_frame = ttk.LabelFrame(f, text='已配置的日志变量', padding=10)
+        list_frame.pack(fill='both', expand=True, padx=6, pady=6)
+        
+        # 创建Treeview显示变量列表
+        columns = ('name', 'byte_pos', 'data_type', 'format')
+        self.log_vars_tree = ttk.Treeview(list_frame, columns=columns, show='headings', height=8)
+        
+        self.log_vars_tree.heading('name', text='变量名称')
+        self.log_vars_tree.heading('byte_pos', text='字节位置')
+        self.log_vars_tree.heading('data_type', text='数据类型')
+        self.log_vars_tree.heading('format', text='显示格式')
+        
+        self.log_vars_tree.column('name', width=150)
+        self.log_vars_tree.column('byte_pos', width=80)
+        self.log_vars_tree.column('data_type', width=100)
+        self.log_vars_tree.column('format', width=120)
+        
+        scrollbar = ttk.Scrollbar(list_frame, orient='vertical', command=self.log_vars_tree.yview)
+        self.log_vars_tree.configure(yscrollcommand=scrollbar.set)
+        
+        self.log_vars_tree.pack(side='left', fill='both', expand=True)
+        scrollbar.pack(side='right', fill='y')
+        
+        # 删除按钮
+        btn_frame2 = ttk.Frame(list_frame)
+        btn_frame2.pack(fill='x', pady=(6, 0))
+        self._btn(btn_frame2, text='删除选中', command=self._remove_log_variable, bootstyle='danger').pack(side='left', padx=2)
+        
+        # 初始化日志变量列表
+        self.log_variables = []  # [(name, byte_pos, data_type, display_format), ...]
         
         return f
 
@@ -2000,6 +2264,260 @@ UDP协议格式: [帧头] [日志数据] [帧尾]
             msg = "配置错误:\n" + "\n".join(f"• {e}" for e in errors)
             messagebox.showerror("日志帧配置错误", msg)
         else:
+            info = f"✓ 日志帧配置有效!\n\n"
+            info += f"帧头: {header} ({len(bytes.fromhex(header))} 字节)\n"
+            if footer:
+                info += f"帧尾: {footer} ({len(bytes.fromhex(footer))} 字节)\n"
+            else:
+                info += f"帧尾: (无)\n"
+            info += f"\n数据格式: {self.log_frame_format.get()}\n"
+            
+            if self.log_frame_format.get() == '标准格式':
+                info += f"\n示例:\n  UDP包: {header} 02 05 [5字节数据] {footer if footer else ''}"
+            else:
+                info += f"\n示例:\n  UDP包: {header} [文本数据] {footer if footer else ''}"
+            
+            messagebox.showinfo("日志帧配置验证", info)
+    
+    def _add_log_variable(self):
+        """添加日志变量"""
+        name = self.log_var_name_entry.get().strip()
+        if not name:
+            messagebox.showerror("错误", "请输入变量名称")
+            return
+        
+        # 检查是否重名
+        for var in self.log_variables:
+            if var[0] == name:
+                messagebox.showerror("错误", f"变量名称 '{name}' 已存在")
+                return
+        
+        byte_pos = self.log_var_byte_pos.get()
+        data_type = self.log_var_data_type.get()
+        display_format = self.log_var_display_format.get()
+        
+        # 添加到列表
+        self.log_variables.append((name, byte_pos, data_type, display_format))
+        
+        # 更新树形视图
+        self.log_vars_tree.insert('', 'end', values=(name, byte_pos, data_type, display_format))
+        
+        # 清空输入框
+        self.log_var_name_entry.delete(0, 'end')
+        
+        # 在日志显示区域创建标签
+        self._create_log_label(name)
+        
+        self._log(f'✓ 已添加日志变量: {name} @ byte[{byte_pos}] ({data_type})')
+    
+    def _remove_log_variable(self):
+        """删除选中的日志变量"""
+        selected = self.log_vars_tree.selection()
+        if not selected:
+            messagebox.showwarning("提示", "请先选择要删除的变量")
+            return
+        
+        for item in selected:
+            values = self.log_vars_tree.item(item, 'values')
+            var_name = values[0]
+            
+            # 从列表中移除
+            self.log_variables = [v for v in self.log_variables if v[0] != var_name]
+            
+            # 从树形视图移除
+            self.log_vars_tree.delete(item)
+            
+            # 从显示区域移除
+            if var_name in self.log_labels:
+                self.log_labels[var_name].destroy()
+                del self.log_labels[var_name]
+            if var_name in self.log_values:
+                del self.log_values[var_name]
+            
+            self._log(f'✓ 已删除日志变量: {var_name}')
+        
+        # 重新排列日志标签
+        self._rearrange_log_labels()
+    
+    def _clear_log_variables(self):
+        """清空所有日志变量"""
+        if not self.log_variables:
+            return
+        
+        result = messagebox.askyesno("确认", "确定要清空所有日志变量吗？")
+        if not result:
+            return
+        
+        # 清空列表
+        self.log_variables.clear()
+        
+        # 清空树形视图
+        for item in self.log_vars_tree.get_children():
+            self.log_vars_tree.delete(item)
+        
+        # 清空显示区域
+        for label in self.log_labels.values():
+            label.destroy()
+        self.log_labels.clear()
+        self.log_values.clear()
+        
+        self._log('✓ 已清空所有日志变量')
+    
+    def _create_log_label(self, var_name):
+        """在日志显示区域创建标签"""
+        # 创建一个标签用于显示日志变量
+        label = tk.Label(self.log_canvas, text=f'{var_name}: --', 
+                        font=('Consolas', 11, 'bold'), 
+                        bg='#1e1e1e', fg='#00ff00',
+                        anchor='w', padx=10, pady=5)
+        
+        self.log_labels[var_name] = label
+        self.log_values[var_name] = None
+        
+        # 重新排列所有标签
+        self._rearrange_log_labels()
+    
+    def _rearrange_log_labels(self):
+        """重新排列日志标签"""
+        y_offset = 5
+        max_width = 0
+        
+        for var_name in self.log_variables:
+            name = var_name[0]
+            if name in self.log_labels:
+                label = self.log_labels[name]
+                self.log_canvas.create_window(5, y_offset, window=label, anchor='nw')
+                y_offset += 30
+                
+                # 更新画布尺寸
+                label.update_idletasks()
+                max_width = max(max_width, label.winfo_width())
+        
+        # 更新画布滚动区域
+        self.log_canvas.configure(scrollregion=(0, 0, max_width + 20, y_offset + 5))
+    
+    def _update_log_display(self, log_data: bytes):
+        """更新日志显示
+        
+        Args:
+            log_data: 日志帧的payload数据（已去除帧头帧尾）
+        """
+        if not self.log_variables:
+            return
+        
+        for var_name, byte_pos, data_type, display_format in self.log_variables:
+            try:
+                value = self._parse_log_value(log_data, byte_pos, data_type)
+                if value is not None:
+                    # 格式化显示
+                    try:
+                        display_text = display_format.format(value=value)
+                    except:
+                        display_text = str(value)
+                    
+                    # 更新标签
+                    if var_name in self.log_labels:
+                        self.log_labels[var_name].config(text=f'{var_name}: {display_text}')
+                        self.log_values[var_name] = value
+            except Exception as e:
+                # 解析失败，显示错误
+                if var_name in self.log_labels:
+                    self.log_labels[var_name].config(text=f'{var_name}: ERR')
+    
+    def _parse_log_value(self, data: bytes, byte_pos: int, data_type: str):
+        """从日志数据中解析指定位置的值
+        
+        Args:
+            data: 日志数据
+            byte_pos: 字节位置
+            data_type: 数据类型
+            
+        Returns:
+            解析后的值，如果失败返回 None
+        """
+        if byte_pos >= len(data):
+            return None
+        
+        try:
+            if data_type == 'uint8':
+                return data[byte_pos]
+            elif data_type == 'int8':
+                return struct.unpack_from('b', data, byte_pos)[0]
+            elif data_type == 'uint16_le':
+                if byte_pos + 1 >= len(data):
+                    return None
+                return struct.unpack_from('<H', data, byte_pos)[0]
+            elif data_type == 'uint16_be':
+                if byte_pos + 1 >= len(data):
+                    return None
+                return struct.unpack_from('>H', data, byte_pos)[0]
+            elif data_type == 'int16_le':
+                if byte_pos + 1 >= len(data):
+                    return None
+                return struct.unpack_from('<h', data, byte_pos)[0]
+            elif data_type == 'int16_be':
+                if byte_pos + 1 >= len(data):
+                    return None
+                return struct.unpack_from('>h', data, byte_pos)[0]
+            elif data_type == 'uint32_le':
+                if byte_pos + 3 >= len(data):
+                    return None
+                return struct.unpack_from('<I', data, byte_pos)[0]
+            elif data_type == 'uint32_be':
+                if byte_pos + 3 >= len(data):
+                    return None
+                return struct.unpack_from('>I', data, byte_pos)[0]
+            elif data_type == 'int32_le':
+                if byte_pos + 3 >= len(data):
+                    return None
+                return struct.unpack_from('<i', data, byte_pos)[0]
+            elif data_type == 'int32_be':
+                if byte_pos + 3 >= len(data):
+                    return None
+                return struct.unpack_from('>i', data, byte_pos)[0]
+            elif data_type == 'float_le':
+                if byte_pos + 3 >= len(data):
+                    return None
+                return struct.unpack_from('<f', data, byte_pos)[0]
+            elif data_type == 'float_be':
+                if byte_pos + 3 >= len(data):
+                    return None
+                return struct.unpack_from('>f', data, byte_pos)[0]
+            else:
+                return None
+        except Exception:
+            return None
+    
+    def _on_log_received(self, log_data: bytes):
+        """日志接收回调（在UDP线程中调用，需要线程安全更新GUI）"""
+        # 使用after方法在主线程中更新GUI
+        self.after(0, lambda: self._update_log_display(log_data))
+    
+    def _validate_log_frame(self):
+        """验证日志帧配置"""
+        header = self.log_frame_header.get().replace(' ', '').strip().upper()
+        footer = self.log_frame_footer.get().replace(' ', '').strip().upper()
+        
+        errors = []
+        
+        if not header:
+            errors.append("帧头不能为空")
+        else:
+            try:
+                bytes.fromhex(header)
+            except ValueError:
+                errors.append(f"帧头格式错误: {header}")
+        
+        if footer:
+            try:
+                bytes.fromhex(footer)
+            except ValueError:
+                errors.append(f"帧尾格式错误: {footer}")
+        
+        if errors:
+            msg = "配置错误:\n" + "\n".join(f"• {e}" for e in errors)
+            messagebox.showerror("日志帧配置错误", msg)
+        else:
             format_type = self.log_frame_format.get()
             info = f"日志帧配置有效!\n\n"
             info += f"帧头: {header} ({len(bytes.fromhex(header))} 字节)\n"
@@ -2082,6 +2600,8 @@ UDP协议格式: [帧头] [日志数据] [帧尾]
             log_frame_header=self.log_frame_header.get(),
             log_frame_footer=self.log_frame_footer.get(),
             log_frame_format=self.log_frame_format.get(),
+            log_callback=self._on_log_received,  # 添加日志回调
+            log_variables=self.log_variables,  # 传递日志变量配置
         )
         
         if self.video_receiver.start():

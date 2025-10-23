@@ -480,17 +480,24 @@ def align_frames_and_logs(frames_csv: str, logs_csv: str, out_csv: str = "aligne
                 continue
 
     # 读 logs.csv
+    log_headers = []  # 保存logs.csv的所有列名
     with open(logs_csv, 'r', encoding='utf-8', newline='') as f:
         rdr = csv.DictReader(f)
+        log_headers = rdr.fieldnames or []  # 获取所有列名
         for row in rdr:
             try:
                 ts_host = _parse_iso(row.get('host_recv_iso', ''))
-                logs.append({
+                log_entry = {
                     'stm32_ts_us': int(row.get('stm32_ts_us', '-1')),
                     'host_iso': row.get('host_recv_iso', ''),
                     'host_ts': ts_host,
                     'log_text_utf8': row.get('log_text_utf8', ''),
-                })
+                }
+                # 保存所有额外字段(自定义变量)
+                for key in row.keys():
+                    if key not in ['stm32_ts_us', 'host_recv_iso', 'log_text_utf8', 'log_hex']:
+                        log_entry[key] = row.get(key, '')
+                logs.append(log_entry)
             except Exception:
                 continue
 
@@ -514,19 +521,36 @@ def align_frames_and_logs(frames_csv: str, logs_csv: str, out_csv: str = "aligne
             cand = logs[cand_idx - 1]
         return cand
 
+    # 收集所有自定义变量列名(除了固定字段)
+    custom_var_names = []
+    for key in log_headers:
+        if key not in ['stm32_ts_us', 'host_recv_iso', 'log_text_utf8', 'log_hex']:
+            custom_var_names.append(key)
+    
     with open(out_csv, 'w', encoding='utf-8', newline='') as f:
         wtr = csv.writer(f)
-        wtr.writerow(["frame_id", "png_path", "frame_host_iso", "h", "w",
-                      "log_host_iso", "log_stm32_ts_us", "log_text_utf8", "host_dt_diff_ms"])
+        # 动态生成表头:固定列 + 自定义变量列
+        header = ["frame_id", "png_path", "frame_host_iso", "h", "w",
+                  "log_host_iso", "log_stm32_ts_us", "log_text_utf8", "host_dt_diff_ms"]
+        header.extend(custom_var_names)  # 添加自定义变量列
+        wtr.writerow(header)
+        
         for fr in frames:
             lg = find_nearest_log(fr['host_ts'])
             if lg is None:
-                wtr.writerow([fr['frame_id'], fr['png_path'], fr['host_iso'], fr['h'], fr['w'],
-                              '', '', '', ''])
+                # 没有匹配的日志
+                row = [fr['frame_id'], fr['png_path'], fr['host_iso'], fr['h'], fr['w'],
+                       '', '', '', '']
+                row.extend([''] * len(custom_var_names))  # 空的自定义变量
+                wtr.writerow(row)
             else:
                 diff_ms = (fr['host_ts'] - lg['host_ts']) * 1000.0
-                wtr.writerow([fr['frame_id'], fr['png_path'], fr['host_iso'], fr['h'], fr['w'],
-                              lg['host_iso'], lg['stm32_ts_us'], lg['log_text_utf8'], f"{diff_ms:.3f}"])
+                row = [fr['frame_id'], fr['png_path'], fr['host_iso'], fr['h'], fr['w'],
+                       lg['host_iso'], lg['stm32_ts_us'], lg['log_text_utf8'], f"{diff_ms:.3f}"]
+                # 添加自定义变量的值
+                for var_name in custom_var_names:
+                    row.append(lg.get(var_name, ''))
+                wtr.writerow(row)
     print(f"[INFO] Aligned CSV saved to {out_csv}")
 
 # ---------------------- CLI ----------------------

@@ -30,7 +30,7 @@ REM 启动GUI
 echo [2/2] 启动GUI界面...
 echo.
 
-python udp_gui.py
+python src/udp_gui.py
 
 echo.
 echo ========================================

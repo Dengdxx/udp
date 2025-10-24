@@ -1,2 +1,0 @@
-# 此文件用于保持data目录在git中被跟踪
-# 数据文件（*.csv, *.mp4, *.png）会被.gitignore忽略

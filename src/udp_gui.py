@@ -38,6 +38,18 @@ except ImportError as e:
     print(f"详细错误: {e}")
     print("请运行以下命令安装：")
     print("    pip install ttkbootstrap")
+    print("\n在 Linux 系统上，可能还需要安装 tk:")
+    print("    Ubuntu/Debian: sudo apt-get install python3-tk")
+    print("    Fedora/RHEL: sudo dnf install python3-tkinter")
+    print("    Arch Linux: sudo pacman -S tk")
+    print("=" * 60)
+    sys.exit(1)
+except Exception as e:
+    print("=" * 60)
+    print(f"ttkbootstrap 加载错误: {e}")
+    print(f"错误类型: {type(e).__name__}")
+    import traceback
+    traceback.print_exc()
     print("=" * 60)
     sys.exit(1)
 
@@ -1109,7 +1121,16 @@ class UdpVideoReceiver:
 
 class App(tb.Window):
     def __init__(self):
-        super().__init__(themename='flatly')  # 可选主题: superhero, cyborg, darkly, litera, flatly, cosmo...
+        # 初始化窗口，使用 flatly 主题（跨平台兼容性较好）
+        try:
+            super().__init__(themename='flatly')
+        except Exception as e:
+            # 如果主题加载失败，尝试使用默认主题
+            print(f"[WARN] Failed to load 'flatly' theme: {e}")
+            try:
+                super().__init__(themename='cosmo')
+            except:
+                super().__init__()  # 使用完全默认的主题
         
         self.title('UDP 上位机 GUI')
         # 增加窗口尺寸，适应高分辨率显示器
@@ -1118,12 +1139,15 @@ class App(tb.Window):
         # 设置最小窗口尺寸，确保界面不会太小
         self.minsize(1200, 800)
         
-        # 尝试启用高DPI支持（Windows系统）
+        # 尝试启用高DPI支持（仅Windows系统）
         try:
-            from ctypes import windll
-            windll.shcore.SetProcessDpiAwareness(1)
-        except:
-            pass  # 非Windows系统或导入失败
+            import platform
+            if platform.system() == 'Windows':
+                from ctypes import windll
+                windll.shcore.SetProcessDpiAwareness(1)
+        except Exception as e:
+            # 非Windows系统或导入失败，静默处理
+            pass
         
         # 设置tkinter默认字体，改善中文显示
         self._setup_fonts()
@@ -1187,12 +1211,16 @@ class App(tb.Window):
             title_font = ('PingFang SC', 12, 'bold')
             fixed_font = ('Menlo', 11)
         else:  # Linux
-            default_font = ('WenQuanYi Micro Hei', 10)
-            title_font = ('WenQuanYi Micro Hei', 12, 'bold')
+            # Linux 字体优先级：WenQuanYi > Noto Sans CJK > DejaVu Sans
+            default_font = ('DejaVu Sans', 10)  # 使用更通用的字体
+            title_font = ('DejaVu Sans', 12, 'bold')
             fixed_font = ('DejaVu Sans Mono', 11)
         
-        # 设置默认字体
-        self.option_add('*Font', default_font)
+        # 设置默认字体（使用 try-except 确保兼容性）
+        try:
+            self.option_add('*Font', default_font)
+        except Exception as e:
+            print(f"[WARN] Font setup failed: {e}")
         
         # 保存字体供后续使用
         self.default_font = default_font

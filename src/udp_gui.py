@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-udp_gui.py - UDP 上位机 GUI（带 ttkbootstrap 优雅降级）
+udp_gui.py - UDP 上位机 GUI（使用 ttkbootstrap 美观主题）
 
 功能概览：
 - 运行/停止 UDP 监听（调用 udp_image_logger.py run）
@@ -10,8 +10,8 @@ udp_gui.py - UDP 上位机 GUI（带 ttkbootstrap 优雅降级）
 - 一键对齐（align）
 - 示波器（scope）：按日志包字节索引选择，支持可选 bit
 
-兼容性：
-- 若环境未安装 ttkbootstrap，将自动回退为标准 ttk 外观（功能不变）。
+依赖要求：
+- 必须安装 ttkbootstrap：pip install ttkbootstrap
 """
 
 import os
@@ -27,21 +27,18 @@ from datetime import datetime
 from typing import Optional, Tuple
 import csv
 
-# 尝试导入 ttkbootstrap；失败则降级为标准 ttk
+# 导入 ttkbootstrap（必需）
 try:
-    import ttkbootstrap as tb  # type: ignore
-    from ttkbootstrap import ttk  # ttkbootstrap 自带 ttk 封装，支持 bootstyle
-    try:
-        from ttkbootstrap.scrolled import ScrolledText as TBScrolledText  # 高级滚动文本
-    except Exception:
-        TBScrolledText = None
-    HAS_TTKBOOTSTRAP = True
-except Exception:
-    tb = None  # type: ignore
-    import tkinter.ttk as ttk  # 标准 ttk
-    from tkinter.scrolledtext import ScrolledText as TkScrolledText
-    TBScrolledText = None
-    HAS_TTKBOOTSTRAP = False
+    import ttkbootstrap as tb
+    from ttkbootstrap import ttk
+    from ttkbootstrap.scrolled import ScrolledText as TBScrolledText
+except ImportError:
+    print("=" * 60)
+    print("错误：未安装 ttkbootstrap")
+    print("请运行以下命令安装：")
+    print("    pip install ttkbootstrap")
+    print("=" * 60)
+    sys.exit(1)
 
 # 导入图像处理库
 try:
@@ -113,8 +110,8 @@ def get_local_ips():
         print(f"[WARN] Failed to get local IPs: {e}")
     return ips
 
-# Switch 控件（仅在较新 ttkbootstrap 中提供）
-Switch = getattr(tb, 'Switch', None) if HAS_TTKBOOTSTRAP else None
+# Switch 控件
+Switch = getattr(tb, 'Switch', None)
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 MAIN_SCRIPT = os.path.join(SCRIPT_DIR, 'udp_image_logger.py')
@@ -809,8 +806,18 @@ class UdpVideoReceiver:
                         if byte_idx < len(data):
                             byte_val = data[byte_idx]
                             if bit_idx is not None:
-                                # 提取特定位
-                                value = (byte_val >> bit_idx) & 1
+                                # 检查是否为切片
+                                if isinstance(bit_idx, tuple) and bit_idx[0] == 'slice':
+                                    # 位切片：提取多个位并组合成一个值
+                                    _, start, end, step = bit_idx
+                                    value = 0
+                                    bit_positions = list(range(start, end, step))
+                                    for i, pos in enumerate(bit_positions):
+                                        bit_val = (byte_val >> pos) & 1
+                                        value |= (bit_val << i)  # 组合成新的值
+                                else:
+                                    # 提取单个位
+                                    value = (byte_val >> bit_idx) & 1
                             else:
                                 # 整个字节值
                                 value = byte_val
@@ -1065,16 +1072,10 @@ class UdpVideoReceiver:
 
 
 
-class App(tb.Window if HAS_TTKBOOTSTRAP else tk.Tk):
+class App(tb.Window):
     def __init__(self):
-        if HAS_TTKBOOTSTRAP:
-            super().__init__(themename='flatly')  # 可选: superhero, cyborg, darkly, litera, flatly...
-            # ttkbootstrap 的 Window 自带 style
-        else:
-            super().__init__()
-            # 标准 ttk 需要手动创建 style
-            self.style = ttk.Style(self)
-
+        super().__init__(themename='flatly')  # 可选主题: superhero, cyborg, darkly, litera, flatly, cosmo...
+        
         self.title('UDP 上位机 GUI')
         self.geometry('1200x800')
         
@@ -1126,40 +1127,23 @@ class App(tb.Window if HAS_TTKBOOTSTRAP else tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self._on_closing)
 
     # ---------- 小部件工厂（处理 bootstyle 兼容） ----------
-    def _btn(self, parent, text, command, bootstyle: str | None = None):
-        if HAS_TTKBOOTSTRAP:
-            return ttk.Button(parent, text=text, command=command, bootstyle=bootstyle)
-        return ttk.Button(parent, text=text, command=command)
+    def _btn(self, parent, text, command, bootstyle: str | None = None, width=None):
+        """创建带 bootstyle 的按钮"""
+        if width is not None:
+            return ttk.Button(parent, text=text, command=command, bootstyle=bootstyle, width=width)
+        return ttk.Button(parent, text=text, command=command, bootstyle=bootstyle)
 
     def _nb(self, parent):
-        if HAS_TTKBOOTSTRAP:
-            return ttk.Notebook(parent, bootstyle='primary')
-        return ttk.Notebook(parent)
+        """创建 Notebook"""
+        return ttk.Notebook(parent, bootstyle='primary')
 
     def _scrolled_text(self, parent):
-        if HAS_TTKBOOTSTRAP and TBScrolledText is not None:
-            return TBScrolledText(parent, autohide=True, height=8, bootstyle='secondary')
-        # 标准 tkinter 的滚动文本
-        if not HAS_TTKBOOTSTRAP:
-            try:
-                from tkinter.scrolledtext import ScrolledText as TkScrolledText  # type: ignore
-                return TkScrolledText(parent, height=8)
-            except Exception:
-                # 兜底：普通 Text + 手动滚动条
-                frame = ttk.Frame(parent)
-                txt = tk.Text(frame, height=8)
-                sb = ttk.Scrollbar(frame, orient='vertical', command=txt.yview)
-                txt.configure(yscrollcommand=sb.set)
-                txt.pack(side='left', fill='both', expand=True)
-                sb.pack(side='right', fill='y')
-                txt._container = frame  # type: ignore[attr-defined]
-                return txt
-        # 若 TBScrolledText 导入失败但处于 ttkbootstrap 环境，用普通 Text
-        return tk.Text(parent, height=8)
+        """创建滚动文本框"""
+        return TBScrolledText(parent, autohide=True, height=8, bootstyle='secondary')
 
     def _add_switch(self, parent, text: str, var, bootstyle: str | None, grid_kwargs: dict):
-        """创建一个开关；若 ttkbootstrap 不可用或无 Switch，则退化为 Checkbutton。"""
-        if HAS_TTKBOOTSTRAP and Switch is not None:
+        """创建开关控件"""
+        if Switch is not None:
             w = Switch(parent, text=text, variable=var, bootstyle=bootstyle)
         else:
             w = ttk.Checkbutton(parent, text=text, variable=var)
@@ -1184,7 +1168,7 @@ class App(tb.Window if HAS_TTKBOOTSTRAP else tk.Tk):
         toolbar = ttk.Frame(left_panel)
         toolbar.pack(fill='x', padx=8, pady=(8, 4))
         ttk.Label(toolbar, text='主题:').pack(side='left')
-        current_theme = 'flatly' if HAS_TTKBOOTSTRAP else self.style.theme_use()
+        current_theme = 'flatly'
         self.theme_var = tk.StringVar(value=current_theme)
         theme_sel = ttk.Combobox(
             toolbar,
@@ -1208,11 +1192,7 @@ class App(tb.Window if HAS_TTKBOOTSTRAP else tk.Tk):
 
         # 输出区域（带滚动）
         self.out_text = self._scrolled_text(left_panel)
-        container = getattr(self.out_text, '_container', None)
-        if container is not None:
-            container.pack(fill='both', expand=True, padx=8, pady=(4, 8))
-        else:
-            self.out_text.pack(fill='both', expand=True, padx=8, pady=(4, 8))
+        self.out_text.pack(fill='both', expand=True, padx=8, pady=(4, 8))
         self._log('提示：点击"启动监听"查看实时视频流。')
         
         # === 右侧视频显示区域 ===
@@ -1715,20 +1695,32 @@ UDP协议格式: [帧头] [日志数据] [帧尾]
         # 上部：图表区域（权重较大，可自适应缩放）
         chart_frame = ttk.LabelFrame(paned, text='实时波形', padding=4)
         
-        # 创建matplotlib图表 - 使用较小的固定尺寸，让canvas自适应
-        self.scope_fig = Figure(figsize=(8, 4), dpi=80)
-        self.scope_ax = self.scope_fig.add_subplot(111)
-        self.scope_ax.set_xlabel('时间 (秒)', fontsize=10)
-        self.scope_ax.set_ylabel('数值', fontsize=10)
-        self.scope_ax.set_title('数据示波器', fontsize=11, fontweight='bold')
-        self.scope_ax.grid(True, alpha=0.3, linestyle='--', linewidth=0.5)
+        # 创建matplotlib图表 - 使用合理的初始尺寸
+        self.scope_fig = Figure(figsize=(8, 5), dpi=100)
+        self.scope_ax_time = None
+        self.scope_ax_freq = None
         
-        # 调整图表边距
-        self.scope_fig.tight_layout(pad=1.5)
+        # 初始化为单图模式
+        self._create_scope_single_plot()
         
         self.scope_canvas = FigureCanvasTkAgg(self.scope_fig, master=chart_frame)
-        self.scope_canvas.draw()
-        self.scope_canvas.get_tk_widget().pack(fill='both', expand=True)
+        canvas_widget = self.scope_canvas.get_tk_widget()
+        canvas_widget.pack(fill='both', expand=True)
+        
+        # 保存canvas引用供后续使用
+        self._scope_canvas_widget = canvas_widget
+        
+        # 绑定窗口大小变化事件，确保图表自适应
+        self._scope_resize_pending = False
+        
+        def _on_canvas_configure(event):
+            # 使用标志位避免频繁重绘
+            if not self._scope_resize_pending:
+                self._scope_resize_pending = True
+                # 延迟执行以避免频繁调用
+                self.after(100, self._resize_scope_canvas)
+        
+        canvas_widget.bind('<Configure>', _on_canvas_configure)
         
         paned.add(chart_frame, weight=3)
         
@@ -1766,21 +1758,21 @@ UDP协议格式: [帧头] [日志数据] [帧尾]
         row1_frame = ttk.Frame(control_frame)
         row1_frame.pack(fill='x', pady=2)
         
-        ttk.Label(row1_frame, text='Byte:').pack(side='left', padx=(0, 2))
-        self.scope_byte_entry = ttk.Entry(row1_frame, width=6)
-        self.scope_byte_entry.pack(side='left', padx=2)
+        ttk.Label(row1_frame, text='选择变量:').pack(side='left', padx=(0, 2))
+        self.scope_log_var_combo = ttk.Combobox(row1_frame, width=20, state='readonly')
+        self.scope_log_var_combo.pack(side='left', padx=2)
+        self.scope_log_var_combo.bind('<<ComboboxSelected>>', self._on_scope_log_var_selected)
         
         ttk.Label(row1_frame, text='Bit:').pack(side='left', padx=(6, 2))
-        self.scope_bit_entry = ttk.Entry(row1_frame, width=4)
+        self.scope_bit_entry = ttk.Entry(row1_frame, width=8)
         self.scope_bit_entry.pack(side='left', padx=2)
-        
-        ttk.Label(row1_frame, text='名称:').pack(side='left', padx=(6, 2))
-        self.scope_var_name = ttk.Entry(row1_frame, width=12)
-        self.scope_var_name.pack(side='left', padx=2)
+        ttk.Label(row1_frame, text='(可选: 3 或 2:5 或 0:8:2)', foreground='gray', font=('Arial', 8)).pack(side='left', padx=(0, 4))
         
         self._btn(row1_frame, text='添加', command=self._add_scope_variable, bootstyle='success').pack(side='left', padx=2)
         self._btn(row1_frame, text='删除', command=self._remove_scope_variable, bootstyle='danger').pack(side='left', padx=2)
         self._btn(row1_frame, text='清空', command=self._clear_scope_variables, bootstyle='secondary').pack(side='left', padx=2)
+        self._btn(row1_frame, text='刷新列表', command=self._refresh_scope_log_vars, bootstyle='info-outline').pack(side='left', padx=2)
+        self._btn(row1_frame, text='?', command=self._show_bit_help, bootstyle='info', width=2).pack(side='left', padx=2)
         
         # 第二行：变量列表
         row2_frame = ttk.Frame(control_frame)
@@ -1817,6 +1809,25 @@ UDP协议格式: [帧头] [日志数据] [帧尾]
         
         self._btn(row3_frame, text='清除数据', command=self._clear_scope_data, bootstyle='warning').pack(side='left', padx=4)
         
+        # 第四行：FFT功能
+        row4_frame = ttk.LabelFrame(control_frame, text='快速傅里叶变换 (FFT)', padding=4)
+        row4_frame.pack(fill='x', pady=4)
+        
+        fft_inner = ttk.Frame(row4_frame)
+        fft_inner.pack(fill='x', pady=2)
+        
+        ttk.Label(fft_inner, text='选择变量:').pack(side='left', padx=(0, 2))
+        self.fft_log_var_combo = ttk.Combobox(fft_inner, width=20, state='readonly')
+        self.fft_log_var_combo.pack(side='left', padx=2)
+        
+        ttk.Label(fft_inner, text='采样间隔:').pack(side='left', padx=(8, 2))
+        self.fft_sample_interval = tk.DoubleVar(value=10.0)
+        ttk.Spinbox(fft_inner, textvariable=self.fft_sample_interval, from_=0.1, to=1000, width=8, increment=1).pack(side='left', padx=2)
+        ttk.Label(fft_inner, text='ms').pack(side='left', padx=(0, 8))
+        
+        self._btn(fft_inner, text='计算FFT', command=self._calculate_fft, bootstyle='info').pack(side='left', padx=2)
+        self._btn(fft_inner, text='清除FFT', command=self._clear_fft, bootstyle='secondary').pack(side='left', padx=2)
+        
         paned.add(control_outer, weight=1)
         
         # 初始化示波器数据结构
@@ -1824,10 +1835,96 @@ UDP协议格式: [帧头] [日志数据] [帧尾]
         self.scope_colors = ['#FF6B6B', '#4ECDC4', '#FFD93D', '#A66FFF', '#6BCF7F', '#FF9F43', '#4A90E2', '#FF6FA3']
         self.scope_color_idx = 0
         
+        # FFT相关
+        self.fft_active = False  # FFT是否激活
+        self.fft_data = {}  # FFT结果缓存 {var_key: (freqs, magnitudes)}
+        
         # 启动更新线程
         self._scope_update_job = None
         
+        # 初始化时刷新日志变量列表（静默模式，不弹窗）
+        self.after(100, lambda: self._refresh_scope_log_vars(show_message=False))
+        self.after(100, lambda: self._refresh_fft_log_vars(show_message=False))
+        
+        # 延迟触发一次图表刷新，确保初始显示正确
+        self.after(200, self._initial_scope_refresh)
+        
         return f
+    
+    def _initial_scope_refresh(self):
+        """初始刷新示波器图表，确保正确适配"""
+        try:
+            if hasattr(self, '_scope_canvas_widget'):
+                # 更新布局以获取实际尺寸
+                self._scope_canvas_widget.update_idletasks()
+                # 调用统一的调整大小函数
+                self._resize_scope_canvas()
+        except Exception as e:
+            print(f"[DEBUG] Initial scope refresh: {e}")
+
+    # ---------------- 示波器图表布局管理 ----------------
+    def _create_scope_single_plot(self):
+        """创建单子图模式（仅时域图）"""
+        self.scope_fig.clear()
+        self.scope_ax_time = self.scope_fig.add_subplot(111)
+        self.scope_ax_time.set_xlabel('时间 (秒)', fontsize=10)
+        self.scope_ax_time.set_ylabel('数值', fontsize=10)
+        self.scope_ax_time.set_title('时域波形', fontsize=11, fontweight='bold')
+        self.scope_ax_time.grid(True, alpha=0.3, linestyle='--', linewidth=0.5)
+        self.scope_ax_freq = None
+        self.scope_fig.tight_layout(pad=1.5)
+    
+    def _create_scope_dual_plot(self):
+        """创建双子图模式（时域+频域）"""
+        self.scope_fig.clear()
+        self.scope_ax_time = self.scope_fig.add_subplot(211)
+        self.scope_ax_time.set_xlabel('时间 (秒)', fontsize=10)
+        self.scope_ax_time.set_ylabel('数值', fontsize=10)
+        self.scope_ax_time.set_title('时域波形', fontsize=11, fontweight='bold')
+        self.scope_ax_time.grid(True, alpha=0.3, linestyle='--', linewidth=0.5)
+        
+        self.scope_ax_freq = self.scope_fig.add_subplot(212)
+        self.scope_ax_freq.set_xlabel('频率 (Hz)', fontsize=10)
+        self.scope_ax_freq.set_ylabel('幅值', fontsize=10)
+        self.scope_ax_freq.set_title('频域幅频曲线 (FFT)', fontsize=11, fontweight='bold')
+        self.scope_ax_freq.grid(True, alpha=0.3, linestyle='--', linewidth=0.5)
+        self.scope_fig.tight_layout(pad=2.0)
+    
+    def _resize_scope_canvas(self):
+        """调整示波器canvas尺寸以适配窗口"""
+        self._scope_resize_pending = False
+        
+        try:
+            if not hasattr(self, '_scope_canvas_widget'):
+                return
+            
+            # 获取canvas的实际尺寸
+            w_px = self._scope_canvas_widget.winfo_width()
+            h_px = self._scope_canvas_widget.winfo_height()
+            
+            # 检查尺寸是否有效
+            if w_px <= 1 or h_px <= 1:
+                return
+            
+            # 转换为英寸（matplotlib使用英寸作为单位）
+            dpi = self.scope_fig.dpi
+            w_inch = w_px / dpi
+            h_inch = h_px / dpi
+            
+            # 更新figure尺寸
+            self.scope_fig.set_size_inches(w_inch, h_inch, forward=True)
+            
+            # 重新调整布局
+            if self.scope_ax_freq is None:
+                self.scope_fig.tight_layout(pad=1.5)
+            else:
+                self.scope_fig.tight_layout(pad=2.0)
+            
+            # 重绘canvas
+            self.scope_canvas.draw_idle()
+            
+        except Exception as e:
+            print(f"[DEBUG] Resize scope canvas error: {e}")
 
     # ---------------- 事件处理 ----------------
     def _on_closing(self):
@@ -2340,6 +2437,13 @@ UDP协议格式: [帧头] [日志数据] [帧尾]
         self._create_log_label(name)
         
         self._log(f'✓ 已添加日志变量: {name} @ byte[{byte_pos}] ({data_type})')
+        
+        # 自动刷新示波器的变量列表
+        if HAS_MATPLOTLIB and hasattr(self, 'scope_log_var_combo'):
+            self._refresh_scope_log_vars()
+        # 自动刷新FFT的变量列表
+        if HAS_MATPLOTLIB and hasattr(self, 'fft_log_var_combo'):
+            self._refresh_fft_log_vars(show_message=False)
     
     def _remove_log_variable(self):
         """删除选中的日志变量"""
@@ -2369,6 +2473,13 @@ UDP协议格式: [帧头] [日志数据] [帧尾]
         
         # 重新排列日志标签
         self._rearrange_log_labels()
+        
+        # 自动刷新示波器的变量列表
+        if HAS_MATPLOTLIB and hasattr(self, 'scope_log_var_combo'):
+            self._refresh_scope_log_vars()
+        # 自动刷新FFT的变量列表
+        if HAS_MATPLOTLIB and hasattr(self, 'fft_log_var_combo'):
+            self._refresh_fft_log_vars(show_message=False)
     
     def _clear_log_variables(self):
         """清空所有日志变量"""
@@ -2393,6 +2504,13 @@ UDP协议格式: [帧头] [日志数据] [帧尾]
         self.log_values.clear()
         
         self._log('✓ 已清空所有日志变量')
+        
+        # 自动刷新示波器的变量列表
+        if HAS_MATPLOTLIB and hasattr(self, 'scope_log_var_combo'):
+            self._refresh_scope_log_vars()
+        # 自动刷新FFT的变量列表
+        if HAS_MATPLOTLIB and hasattr(self, 'fft_log_var_combo'):
+            self._refresh_fft_log_vars(show_message=False)
     
     def _create_log_label(self, var_name):
         """在日志显示区域创建标签"""
@@ -2693,30 +2811,92 @@ UDP协议格式: [帧头] [日志数据] [帧尾]
         if not HAS_MATPLOTLIB:
             return
         
-        try:
-            byte_idx = int(self.scope_byte_entry.get())
-        except ValueError:
-            messagebox.showerror('错误', 'Byte索引必须是整数')
+        # 从下拉框获取选中的日志变量
+        selected = self.scope_log_var_combo.get()
+        if not selected:
+            messagebox.showerror('错误', '请先从下拉框选择一个日志变量')
             return
         
+        # 解析选中的变量信息
+        # selected 格式: "变量名 (Byte[X], 类型)"
+        # 需要找到对应的log_variables条目
+        var_info = None
+        for log_var in self.log_variables:
+            var_name, byte_pos, data_type, display_format = log_var
+            if selected.startswith(var_name + ' '):
+                var_info = log_var
+                break
+        
+        if not var_info:
+            messagebox.showerror('错误', '无法找到对应的日志变量，请刷新列表后重试')
+            return
+        
+        var_name, byte_pos, data_type, display_format = var_info
+        byte_idx = byte_pos
+        
+        # 获取bit索引或切片（可选）
         bit_str = self.scope_bit_entry.get().strip()
         bit_idx = None
-        if bit_str:
-            try:
-                bit_idx = int(bit_str)
-                if bit_idx < 0 or bit_idx > 7:
-                    messagebox.showerror('错误', 'Bit索引必须在0-7之间')
-                    return
-            except ValueError:
-                messagebox.showerror('错误', 'Bit索引必须是整数')
-                return
+        bit_slice = None
         
-        name = self.scope_var_name.get().strip()
-        if not name:
-            if bit_idx is not None:
-                name = f"Byte[{byte_idx}].Bit[{bit_idx}]"
+        if bit_str:
+            # 支持三种格式：
+            # 1. 单个位: "3" -> bit[3]
+            # 2. 切片: "3:5" -> bit[3:5]（提取bit3和bit4，不包括bit5）
+            # 3. 切片带步长: "0:8:2" -> bit[0:8:2]（提取bit0,2,4,6）
+            
+            if ':' in bit_str:
+                # 切片格式
+                try:
+                    parts = bit_str.split(':')
+                    if len(parts) == 2:
+                        start = int(parts[0]) if parts[0] else 0
+                        end = int(parts[1]) if parts[1] else 8
+                        bit_slice = (start, end, 1)
+                    elif len(parts) == 3:
+                        start = int(parts[0]) if parts[0] else 0
+                        end = int(parts[1]) if parts[1] else 8
+                        step = int(parts[2]) if parts[2] else 1
+                        bit_slice = (start, end, step)
+                    else:
+                        messagebox.showerror('错误', '位切片格式错误，应为 start:end 或 start:end:step')
+                        return
+                    
+                    # 验证范围
+                    if start < 0 or start > 7 or end < 0 or end > 8:
+                        messagebox.showerror('错误', '位索引必须在0-7之间（end可以为8）')
+                        return
+                    if start >= end:
+                        messagebox.showerror('错误', 'start必须小于end')
+                        return
+                    
+                except ValueError:
+                    messagebox.showerror('错误', '位切片格式错误，应为整数')
+                    return
             else:
-                name = f"Byte[{byte_idx}]"
+                # 单个位
+                try:
+                    bit_idx = int(bit_str)
+                    if bit_idx < 0 or bit_idx > 7:
+                        messagebox.showerror('错误', 'Bit索引必须在0-7之间')
+                        return
+                except ValueError:
+                    messagebox.showerror('错误', 'Bit索引必须是整数')
+                    return
+        
+        # 构建显示名称
+        if bit_slice is not None:
+            start, end, step = bit_slice
+            if step == 1:
+                name = f"{var_name}.Bit[{start}:{end}]"
+            else:
+                name = f"{var_name}.Bit[{start}:{end}:{step}]"
+            # 使用元组作为标识，区别于单个bit
+            bit_idx = ('slice', start, end, step)
+        elif bit_idx is not None:
+            name = f"{var_name}.Bit[{bit_idx}]"
+        else:
+            name = var_name
         
         # 检查是否已存在
         for var in self.scope_variables:
@@ -2732,8 +2912,18 @@ UDP协议格式: [帧头] [日志数据] [帧尾]
         self.scope_variables.append((byte_idx, bit_idx, name, color))
         
         # 更新列表显示
-        bit_text = f".Bit[{bit_idx}]" if bit_idx is not None else ""
-        self.scope_var_listbox.insert('end', f"● {name}  (Byte[{byte_idx}]{bit_text})  —  {color}")
+        if isinstance(bit_idx, tuple) and bit_idx[0] == 'slice':
+            _, start, end, step = bit_idx
+            if step == 1:
+                bit_text = f".Bit[{start}:{end}]"
+            else:
+                bit_text = f".Bit[{start}:{end}:{step}]"
+        elif bit_idx is not None:
+            bit_text = f".Bit[{bit_idx}]"
+        else:
+            bit_text = ""
+        
+        self.scope_var_listbox.insert('end', f"● {name}  (Byte[{byte_idx}]{bit_text}, {data_type})  —  {color}")
         self.scope_var_listbox.itemconfig('end', foreground=color)
         
         # 初始化数据存储
@@ -2746,14 +2936,253 @@ UDP协议格式: [帧头] [日志数据] [帧尾]
         
         self._log(f'✓ 添加监控变量: {name}')
         
-        # 清空输入
-        self.scope_byte_entry.delete(0, 'end')
+        # 清空bit输入
         self.scope_bit_entry.delete(0, 'end')
-        self.scope_var_name.delete(0, 'end')
         
         # 启动更新
         if not self._scope_update_job:
             self._start_scope_update()
+    
+    def _show_bit_help(self):
+        """显示Bit功能帮助信息"""
+        help_text = """
+【位（Bit）提取功能说明】
+
+一个字节(Byte)包含8位(Bit)，编号从0到7。
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📌 使用方式：
+
+1️⃣ 提取单个位
+   输入：3
+   说明：提取第3位的值（0或1）
+   
+2️⃣ 提取位切片
+   输入：2:5
+   说明：提取bit2到bit4（不包括bit5）
+   结果：将这些位组合成一个值
+   例如：byte=0b10110100
+        bit[2:5] 提取bit2,3,4 = 0b101 = 5
+   
+3️⃣ 带步长的切片
+   输入：0:8:2
+   说明：从bit0到bit7，每隔2位取一个
+   结果：提取bit0,2,4,6并组合
+   
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+💡 应用场景：
+
+• 状态标志位：某位表示电机使能/刹车等
+• 多位数值：某几位组合表示速度档位(0-7)
+• 间隔采样：提取奇数位或偶数位的数据
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+示例：
+假设 Byte[5] = 0b11010110 (十进制214)
+
+• Bit留空    → 显示整个字节: 214
+• Bit填"3"   → 显示第3位: 0
+• Bit填"2:6" → 显示bit2-5组合: 0b0101 = 5
+• Bit填"0:8:2" → 显示bit0,2,4,6: 0b0111 = 7
+        """
+        messagebox.showinfo("Bit功能帮助", help_text)
+    
+    def _refresh_scope_log_vars(self, show_message=True):
+        """刷新示波器的日志变量下拉列表
+        
+        Args:
+            show_message: 是否显示提示消息（默认True，初始化时设为False避免弹窗）
+        """
+        if not HAS_MATPLOTLIB:
+            return
+        
+        # 清空当前列表
+        self.scope_log_var_combo['values'] = []
+        
+        # 如果没有配置日志变量
+        if not self.log_variables:
+            if show_message:
+                messagebox.showinfo('提示', '请先在"自定义帧→日志变量配置"中添加日志变量')
+            else:
+                # 静默模式，仅记录日志
+                self._log('提示：可在"自定义帧→日志变量配置"中添加日志变量')
+            return
+        
+        # 构建下拉选项列表
+        options = []
+        for var_name, byte_pos, data_type, display_format in self.log_variables:
+            option = f"{var_name} (Byte[{byte_pos}], {data_type})"
+            options.append(option)
+        
+        self.scope_log_var_combo['values'] = options
+        if options:
+            self.scope_log_var_combo.current(0)
+        
+        if show_message:
+            self._log(f'✓ 已刷新示波器变量列表 (共{len(options)}个变量)')
+        else:
+            self._log(f'已加载 {len(options)} 个日志变量')
+    
+    def _on_scope_log_var_selected(self, event=None):
+        """当选择日志变量时的回调"""
+        # 可以在这里添加额外的逻辑，例如显示变量详情
+        pass
+    
+    def _refresh_fft_log_vars(self, show_message=True):
+        """刷新FFT的日志变量下拉列表"""
+        if not HAS_MATPLOTLIB:
+            return
+        
+        # 清空当前列表
+        self.fft_log_var_combo['values'] = []
+        
+        # 如果没有配置日志变量
+        if not self.log_variables:
+            if show_message:
+                self._log('提示：请先添加日志变量')
+            return
+        
+        # 构建下拉选项列表
+        options = []
+        for var_name, byte_pos, data_type, display_format in self.log_variables:
+            option = f"{var_name} (Byte[{byte_pos}], {data_type})"
+            options.append(option)
+        
+        self.fft_log_var_combo['values'] = options
+        if options:
+            self.fft_log_var_combo.current(0)
+        
+        if show_message:
+            self._log(f'✓ FFT变量列表已更新')
+    
+    def _calculate_fft(self):
+        """计算并显示FFT"""
+        if not HAS_MATPLOTLIB:
+            return
+        
+        # 获取选中的变量
+        selected = self.fft_log_var_combo.get()
+        if not selected:
+            messagebox.showerror('错误', '请先选择要分析的变量')
+            return
+        
+        # 解析选中的变量信息
+        var_info = None
+        for log_var in self.log_variables:
+            var_name, byte_pos, data_type, display_format = log_var
+            if selected.startswith(var_name + ' '):
+                var_info = log_var
+                break
+        
+        if not var_info:
+            messagebox.showerror('错误', '无法找到对应的日志变量')
+            return
+        
+        var_name, byte_pos, data_type, display_format = var_info
+        byte_idx = byte_pos
+        bit_idx = None  # FFT不支持bit提取，使用整字节
+        
+        # 获取数据
+        if not self.video_receiver or not self.video_receiver._running:
+            messagebox.showwarning('提示', '请先启动监听以收集数据')
+            return
+        
+        with self.video_receiver.scope_lock:
+            key = (byte_idx, bit_idx)
+            if key not in self.video_receiver.scope_data:
+                messagebox.showwarning('提示', f'变量 {var_name} 暂无数据，请等待数据采集')
+                return
+            
+            data_deque = self.video_receiver.scope_data[key]
+            if len(data_deque) < 10:
+                messagebox.showwarning('提示', f'数据点太少（{len(data_deque)}个），需要至少10个数据点')
+                return
+            
+            # 提取时间和值
+            times = []
+            values = []
+            for timestamp, value in data_deque:
+                times.append(timestamp)
+                values.append(value)
+        
+        if len(values) < 10:
+            messagebox.showwarning('提示', '数据不足，无法进行FFT分析')
+            return
+        
+        try:
+            # 导入numpy用于FFT计算
+            import numpy as np
+            
+            # 获取采样间隔（毫秒转秒）
+            sample_interval_ms = self.fft_sample_interval.get()
+            sample_interval = sample_interval_ms / 1000.0  # 转换为秒
+            
+            # 计算实际采样率（从数据中）
+            time_diffs = np.diff(times)
+            if len(time_diffs) > 0:
+                actual_sample_rate = 1.0 / np.mean(time_diffs)
+                self._log(f'实际采样率: {actual_sample_rate:.2f} Hz (平均间隔: {np.mean(time_diffs)*1000:.2f} ms)')
+            else:
+                actual_sample_rate = 1.0 / sample_interval
+            
+            # 使用用户指定的采样间隔作为目标采样率
+            target_sample_rate = 1.0 / sample_interval
+            
+            # 对数据进行重采样（线性插值）
+            times_array = np.array(times)
+            values_array = np.array(values, dtype=float)
+            
+            # 创建均匀时间序列
+            time_start = times_array[0]
+            time_end = times_array[-1]
+            n_samples = int((time_end - time_start) / sample_interval)
+            
+            if n_samples < 10:
+                messagebox.showwarning('提示', f'采样间隔过大，仅能生成{n_samples}个样本点，请减小采样间隔')
+                return
+            
+            uniform_times = np.linspace(time_start, time_end, n_samples)
+            uniform_values = np.interp(uniform_times, times_array, values_array)
+            
+            # 去除直流分量
+            uniform_values = uniform_values - np.mean(uniform_values)
+            
+            # 应用汉宁窗减少频谱泄漏
+            window = np.hanning(len(uniform_values))
+            windowed_values = uniform_values * window
+            
+            # 执行FFT
+            fft_result = np.fft.fft(windowed_values)
+            n = len(fft_result)
+            
+            # 只取正频率部分
+            freqs = np.fft.fftfreq(n, sample_interval)[:n//2]
+            magnitudes = np.abs(fft_result)[:n//2] * 2 / n  # 归一化
+            
+            # 保存FFT结果
+            self.fft_data[key] = (freqs, magnitudes, var_name)
+            self.fft_active = True
+            
+            self._log(f'✓ 已计算 {var_name} 的FFT (样本数: {n}, 频率分辨率: {freqs[1]:.4f} Hz)')
+            
+            # 更新显示
+            if not self._scope_update_job:
+                self._start_scope_update()
+            
+        except Exception as e:
+            messagebox.showerror('FFT计算错误', f'计算FFT时出错：\n{str(e)}')
+            self._log(f'[ERROR] FFT计算失败: {e}')
+    
+    def _clear_fft(self):
+        """清除FFT显示"""
+        self.fft_active = False
+        self.fft_data.clear()
+        self._log('✓ 已清除FFT显示')
+        
+        # 切换回单图模式
+        if HAS_MATPLOTLIB:
+            self._create_scope_single_plot()
+            self.scope_canvas.draw()
     
     def _remove_scope_variable(self):
         """删除选中的监控变量"""
@@ -2812,12 +3241,23 @@ UDP协议格式: [帧头] [日志数据] [帧尾]
             return
         
         try:
-            # 清空图表
-            self.scope_ax.clear()
-            self.scope_ax.set_xlabel('时间 (秒)', fontsize=10)
-            self.scope_ax.set_ylabel('数值', fontsize=10)
-            self.scope_ax.set_title('数据示波器', fontsize=12, fontweight='bold')
-            self.scope_ax.grid(True, alpha=0.3)
+            # 检查是否需要切换布局模式
+            need_dual_plot = self.fft_active and self.fft_data
+            current_is_dual = self.scope_ax_freq is not None
+            
+            if need_dual_plot and not current_is_dual:
+                # 切换到双图模式
+                self._create_scope_dual_plot()
+            elif not need_dual_plot and current_is_dual:
+                # 切换到单图模式
+                self._create_scope_single_plot()
+            
+            # === 更新时域图 ===
+            self.scope_ax_time.clear()
+            self.scope_ax_time.set_xlabel('时间 (秒)', fontsize=10)
+            self.scope_ax_time.set_ylabel('数值', fontsize=10)
+            self.scope_ax_time.set_title('时域波形', fontsize=11, fontweight='bold')
+            self.scope_ax_time.grid(True, alpha=0.3, linestyle='--', linewidth=0.5)
             
             # 获取时间窗口
             time_window = self.scope_time_window.get()
@@ -2846,25 +3286,76 @@ UDP协议格式: [帧头] [日志数据] [帧尾]
                             values.append(value)
                     
                     if times:
-                        self.scope_ax.plot(times, values, label=name, color=color, linewidth=1.5, marker='o', markersize=3)
+                        self.scope_ax_time.plot(times, values, label=name, color=color, linewidth=1.5, marker='o', markersize=2)
                         has_data = True
             
             if has_data:
-                self.scope_ax.legend(loc='upper right', fontsize=9)
+                self.scope_ax_time.legend(loc='upper right', fontsize=8)
                 
                 # 设置Y轴范围
                 if not self.scope_auto_scale.get():
-                    self.scope_ax.set_ylim(-10, 270)
+                    self.scope_ax_time.set_ylim(-10, 270)
             else:
-                self.scope_ax.text(0.5, 0.5, '等待数据...', 
+                self.scope_ax_time.text(0.5, 0.5, '等待数据...', 
                                   horizontalalignment='center', verticalalignment='center',
-                                  transform=self.scope_ax.transAxes, fontsize=14, color='gray')
+                                  transform=self.scope_ax_time.transAxes, fontsize=12, color='gray')
             
-            # 刷新画布
+            # === 更新频域图（仅在FFT激活且有数据时） ===
+            if self.scope_ax_freq is not None and self.fft_active and self.fft_data:
+                self.scope_ax_freq.clear()
+                self.scope_ax_freq.set_xlabel('频率 (Hz)', fontsize=10)
+                self.scope_ax_freq.set_ylabel('幅值', fontsize=10)
+                self.scope_ax_freq.set_title('频域幅频曲线 (FFT)', fontsize=11, fontweight='bold')
+                self.scope_ax_freq.grid(True, alpha=0.3, linestyle='--', linewidth=0.5)
+                # 绘制FFT结果
+                for key, (freqs, magnitudes, var_name) in self.fft_data.items():
+                    # 找到对应的颜色
+                    color = '#4A90E2'  # 默认颜色
+                    for byte_idx, bit_idx, name, c in self.scope_variables:
+                        if (byte_idx, bit_idx) == key:
+                            color = c
+                            break
+                    
+                    self.scope_ax_freq.plot(freqs, magnitudes, label=var_name, color=color, linewidth=1.5)
+                
+                self.scope_ax_freq.legend(loc='upper right', fontsize=8)
+                self.scope_ax_freq.set_xlim(left=0)  # 频率从0开始
+                
+                # 找出主要频率成分（前3个峰值）
+                try:
+                    import numpy as np
+                    for key, (freqs, magnitudes, var_name) in self.fft_data.items():
+                        if len(magnitudes) > 10:
+                            # 找到峰值
+                            peaks_idx = []
+                            for i in range(1, len(magnitudes)-1):
+                                if magnitudes[i] > magnitudes[i-1] and magnitudes[i] > magnitudes[i+1]:
+                                    peaks_idx.append(i)
+                            
+                            # 按幅值排序，取前3个
+                            peaks_idx = sorted(peaks_idx, key=lambda i: magnitudes[i], reverse=True)[:3]
+                            
+                            # 标注峰值
+                            for idx in peaks_idx:
+                                if magnitudes[idx] > np.max(magnitudes) * 0.1:  # 只标注幅值>10%最大值的峰
+                                    self.scope_ax_freq.annotate(
+                                        f'{freqs[idx]:.2f}Hz',
+                                        xy=(freqs[idx], magnitudes[idx]),
+                                        xytext=(5, 5), textcoords='offset points',
+                                        fontsize=8, color='red',
+                                        bbox=dict(boxstyle='round,pad=0.3', facecolor='yellow', alpha=0.7)
+                                    )
+                except ImportError:
+                    pass  # numpy不可用时跳过峰值标注
+            
+            # 调整布局并刷新画布（自动适配当前子图数量）
+            self.scope_fig.tight_layout(pad=1.5 if self.scope_ax_freq is None else 2.0)
             self.scope_canvas.draw()
             
         except Exception as e:
             print(f"[ERROR] Scope update error: {e}")
+            import traceback
+            traceback.print_exc()
         
         # 继续更新
         refresh_interval = int(1000 / self.scope_refresh_rate.get())

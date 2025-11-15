@@ -9,4 +9,5 @@ dependencies:
   - matplotlib
   - pip
   - pip:
-      - pillow  # 可选，若后续需要
+      - pillow
+      - ttkbootstrap>=1.10.0  # 美观的 UI 主题（必需）

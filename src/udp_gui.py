@@ -30,11 +30,12 @@ import csv
 # 导入 ttkbootstrap（必需）
 try:
     import ttkbootstrap as tb
-    import tkinter.ttk as ttk
-    from ttkbootstrap.widgets.scrolled import ScrolledText as TBScrolledText
-except ImportError:
+    from ttkbootstrap import ttk
+    from ttkbootstrap.scrolled import ScrolledText as TBScrolledText
+except ImportError as e:
     print("=" * 60)
-    print("错误：未安装 ttkbootstrap")
+    print("错误：未安装 ttkbootstrap 或导入失败")
+    print(f"详细错误: {e}")
     print("请运行以下命令安装：")
     print("    pip install ttkbootstrap")
     print("=" * 60)

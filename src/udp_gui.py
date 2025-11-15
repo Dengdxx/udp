@@ -30,8 +30,8 @@ import csv
 # 导入 ttkbootstrap（必需）
 try:
     import ttkbootstrap as tb
-    from ttkbootstrap import ttk
-    from ttkbootstrap.scrolled import ScrolledText as TBScrolledText
+    import tkinter.ttk as ttk
+    from ttkbootstrap.widgets.scrolled import ScrolledText as TBScrolledText
 except ImportError:
     print("=" * 60)
     print("错误：未安装 ttkbootstrap")
@@ -81,9 +81,43 @@ def sanitize_csv_text(text: str) -> str:
 try:
     import matplotlib
     matplotlib.use('TkAgg')
-    # 设置中文字体支持
-    matplotlib.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei', 'Arial Unicode MS', 'DejaVu Sans']
+    # 设置中文字体支持，优先使用系统中可用的中文字体
+    import platform
+    system = platform.system()
+    if system == 'Windows':
+        matplotlib.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei', 'KaiTi', 'FangSong', 'Arial Unicode MS', 'DejaVu Sans']
+    elif system == 'Darwin':  # macOS
+        matplotlib.rcParams['font.sans-serif'] = ['PingFang SC', 'Hiragino Sans GB', 'STHeiti', 'Arial Unicode MS', 'DejaVu Sans']
+    else:  # Linux
+        matplotlib.rcParams['font.sans-serif'] = ['WenQuanYi Micro Hei', 'Droid Sans Fallback', 'AR PL UMing CN', 'AR PL UKai CN', 'Noto Sans CJK SC', 'DejaVu Sans']
+    
     matplotlib.rcParams['axes.unicode_minus'] = False  # 解决负号显示问题
+    matplotlib.rcParams['font.size'] = 12  # 设置默认字体大小
+    
+    # 尝试设置更具体的字体，避免字体缺失警告
+    try:
+        import matplotlib.font_manager
+        font_manager = matplotlib.font_manager.FontManager()
+        
+        # 检查系统中可用的字体
+        available_fonts = [f.name for f in font_manager.ttflist]
+        
+        # 根据系统选择最佳字体
+        if system == 'Windows':
+            preferred_fonts = ['Microsoft YaHei', 'SimHei', 'KaiTi', 'FangSong']
+        elif system == 'Darwin':  # macOS
+            preferred_fonts = ['PingFang SC', 'Hiragino Sans GB', 'STHeiti']
+        else:  # Linux
+            preferred_fonts = ['WenQuanYi Micro Hei', 'Noto Sans CJK SC', 'AR PL UMing CN']
+        
+        # 找到第一个可用的首选字体
+        for font in preferred_fonts:
+            if font in available_fonts:
+                matplotlib.rcParams['font.family'] = [font]
+                break
+    except:
+        pass  # 如果字体检测失败，使用默认设置
+    
     from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
     from matplotlib.figure import Figure
     import matplotlib.pyplot as plt
@@ -1077,7 +1111,21 @@ class App(tb.Window):
         super().__init__(themename='flatly')  # 可选主题: superhero, cyborg, darkly, litera, flatly, cosmo...
         
         self.title('UDP 上位机 GUI')
-        self.geometry('1200x800')
+        # 增加窗口尺寸，适应高分辨率显示器
+        self.geometry('1600x1000')
+        
+        # 设置最小窗口尺寸，确保界面不会太小
+        self.minsize(1200, 800)
+        
+        # 尝试启用高DPI支持（Windows系统）
+        try:
+            from ctypes import windll
+            windll.shcore.SetProcessDpiAwareness(1)
+        except:
+            pass  # 非Windows系统或导入失败
+        
+        # 设置tkinter默认字体，改善中文显示
+        self._setup_fonts()
         
         # UDP 视频接收器
         self.video_receiver: Optional[UdpVideoReceiver] = None
@@ -1122,6 +1170,33 @@ class App(tb.Window):
     # 已移除 C 扩展处理选项（ctypes），保持 GUI 简洁
 
         self._build_ui()
+    
+    def _setup_fonts(self):
+        """设置字体，改善中文显示效果"""
+        import platform
+        system = platform.system()
+        
+        # 根据操作系统选择合适的中文字体
+        if system == 'Windows':
+            default_font = ('Microsoft YaHei', 10)
+            title_font = ('Microsoft YaHei', 12, 'bold')
+            fixed_font = ('Consolas', 11)
+        elif system == 'Darwin':  # macOS
+            default_font = ('PingFang SC', 10)
+            title_font = ('PingFang SC', 12, 'bold')
+            fixed_font = ('Menlo', 11)
+        else:  # Linux
+            default_font = ('WenQuanYi Micro Hei', 10)
+            title_font = ('WenQuanYi Micro Hei', 12, 'bold')
+            fixed_font = ('DejaVu Sans Mono', 11)
+        
+        # 设置默认字体
+        self.option_add('*Font', default_font)
+        
+        # 保存字体供后续使用
+        self.default_font = default_font
+        self.title_font = title_font
+        self.fixed_font = fixed_font
         
         # 绑定关闭事件
         self.protocol("WM_DELETE_WINDOW", self._on_closing)
@@ -1207,7 +1282,7 @@ class App(tb.Window):
         stats_frame = ttk.Frame(video_frame)
         stats_frame.pack(fill='x', pady=(8, 0))
         
-        self.stats_label = ttk.Label(stats_frame, text='等待视频流...', font=('Consolas', 9))
+        self.stats_label = ttk.Label(stats_frame, text='等待视频流...', font=('Consolas', 11, 'bold'))
         self.stats_label.pack()
         
         # 实时日志显示区域
@@ -1271,7 +1346,7 @@ class App(tb.Window):
         
         # 配置文本框样式（等宽字体）
         try:
-            self.data_text.configure(font=('Consolas', 9), height=8)
+            self.data_text.configure(font=('Consolas', 11), height=8)
         except:
             pass
         
@@ -1430,7 +1505,7 @@ class App(tb.Window):
         ttk.Separator(f, orient='horizontal').grid(row=row, column=0, columnspan=4, sticky='ew', pady=10)
         
         row += 1
-        help_text = tk.Text(f, height=8, width=70, wrap='word', font=('Arial', 9))
+        help_text = tk.Text(f, height=8, width=70, wrap='word', font=('Arial', 11))
         help_text.grid(row=row, column=0, columnspan=4, sticky='we', padx=6, pady=6)
         
         help_content = """图像帧格式说明：
@@ -1525,7 +1600,7 @@ STM32压缩示例(60x120):
         ttk.Separator(f, orient='horizontal').grid(row=row, column=0, columnspan=4, sticky='ew', pady=10)
         
         row += 1
-        help_text = tk.Text(f, height=10, width=70, wrap='word', font=('Arial', 9))
+        help_text = tk.Text(f, height=10, width=70, wrap='word', font=('Arial', 11))
         help_text.grid(row=row, column=0, columnspan=4, sticky='we', padx=6, pady=6)
         
         help_content = """日志帧格式说明：
@@ -1696,7 +1771,7 @@ UDP协议格式: [帧头] [日志数据] [帧尾]
         chart_frame = ttk.LabelFrame(paned, text='实时波形', padding=4)
         
         # 创建matplotlib图表 - 使用合理的初始尺寸
-        self.scope_fig = Figure(figsize=(8, 5), dpi=100)
+        self.scope_fig = Figure(figsize=(8, 5), dpi=120)
         self.scope_ax_time = None
         self.scope_ax_freq = None
         
@@ -1783,7 +1858,7 @@ UDP协议格式: [帧头] [日志数据] [帧尾]
         list_frame = ttk.Frame(row2_frame)
         list_frame.pack(fill='x', pady=2)
         
-        self.scope_var_listbox = tk.Listbox(list_frame, height=2, font=('Consolas', 8))
+        self.scope_var_listbox = tk.Listbox(list_frame, height=2, font=('Consolas', 10))
         self.scope_var_listbox.pack(side='left', fill='both', expand=True)
         
         list_scrollbar = ttk.Scrollbar(list_frame, orient='vertical', command=self.scope_var_listbox.yview)
@@ -1867,9 +1942,9 @@ UDP协议格式: [帧头] [日志数据] [帧尾]
         """创建单子图模式（仅时域图）"""
         self.scope_fig.clear()
         self.scope_ax_time = self.scope_fig.add_subplot(111)
-        self.scope_ax_time.set_xlabel('时间 (秒)', fontsize=10)
-        self.scope_ax_time.set_ylabel('数值', fontsize=10)
-        self.scope_ax_time.set_title('时域波形', fontsize=11, fontweight='bold')
+        self.scope_ax_time.set_xlabel('时间 (秒)', fontsize=12)
+        self.scope_ax_time.set_ylabel('数值', fontsize=12)
+        self.scope_ax_time.set_title('时域波形', fontsize=13, fontweight='bold')
         self.scope_ax_time.grid(True, alpha=0.3, linestyle='--', linewidth=0.5)
         self.scope_ax_freq = None
         self.scope_fig.tight_layout(pad=1.5)
@@ -1878,15 +1953,15 @@ UDP协议格式: [帧头] [日志数据] [帧尾]
         """创建双子图模式（时域+频域）"""
         self.scope_fig.clear()
         self.scope_ax_time = self.scope_fig.add_subplot(211)
-        self.scope_ax_time.set_xlabel('时间 (秒)', fontsize=10)
-        self.scope_ax_time.set_ylabel('数值', fontsize=10)
-        self.scope_ax_time.set_title('时域波形', fontsize=11, fontweight='bold')
+        self.scope_ax_time.set_xlabel('时间 (秒)', fontsize=12)
+        self.scope_ax_time.set_ylabel('数值', fontsize=12)
+        self.scope_ax_time.set_title('时域波形', fontsize=13, fontweight='bold')
         self.scope_ax_time.grid(True, alpha=0.3, linestyle='--', linewidth=0.5)
         
         self.scope_ax_freq = self.scope_fig.add_subplot(212)
-        self.scope_ax_freq.set_xlabel('频率 (Hz)', fontsize=10)
-        self.scope_ax_freq.set_ylabel('幅值', fontsize=10)
-        self.scope_ax_freq.set_title('频域幅频曲线 (FFT)', fontsize=11, fontweight='bold')
+        self.scope_ax_freq.set_xlabel('频率 (Hz)', fontsize=12)
+        self.scope_ax_freq.set_ylabel('幅值', fontsize=12)
+        self.scope_ax_freq.set_title('频域幅频曲线 (FFT)', fontsize=13, fontweight='bold')
         self.scope_ax_freq.grid(True, alpha=0.3, linestyle='--', linewidth=0.5)
         self.scope_fig.tight_layout(pad=2.0)
     
@@ -1953,7 +2028,7 @@ UDP协议格式: [帧头] [日志数据] [帧尾]
                 w // 2, h // 2,
                 text='等待视频流...\n请点击"启动监听"开始接收',
                 fill='white',
-                font=('Arial', 14),
+                font=('Arial', 16, 'bold'),
                 justify='center'
             )
     
@@ -2112,23 +2187,23 @@ UDP协议格式: [帧头] [日志数据] [帧尾]
                         anchor='nw',
                         text=f"帧: {self.video_receiver.frame_counter}",
                         fill='lime',
-                        font=('Consolas', 10, 'bold')
+                        font=('Consolas', 12, 'bold')
                     )
-                    info_y += 20
+                    info_y += 25
                     self.video_canvas.create_text(
                         10, info_y,
                         anchor='nw',
                         text=f"FPS: {self.video_receiver.fps:.1f}",
                         fill='lime',
-                        font=('Consolas', 10, 'bold')
+                        font=('Consolas', 12, 'bold')
                     )
-                    info_y += 20
+                    info_y += 25
                     self.video_canvas.create_text(
                         10, info_y,
                         anchor='nw',
                         text=f"大小: {w}x{h}",
                         fill='lime',
-                        font=('Consolas', 10, 'bold')
+                        font=('Consolas', 12, 'bold')
                     )
                     
                     # 更新统计标签
@@ -2515,8 +2590,8 @@ UDP协议格式: [帧头] [日志数据] [帧尾]
     def _create_log_label(self, var_name):
         """在日志显示区域创建标签"""
         # 创建一个标签用于显示日志变量
-        label = tk.Label(self.log_canvas, text=f'{var_name}: --', 
-                        font=('Consolas', 11, 'bold'), 
+        label = tk.Label(self.log_canvas, text=f'{var_name}: --',
+                        font=('Consolas', 13, 'bold'),
                         bg='#1e1e1e', fg='#00ff00',
                         anchor='w', padx=10, pady=5)
         
@@ -3254,9 +3329,9 @@ UDP协议格式: [帧头] [日志数据] [帧尾]
             
             # === 更新时域图 ===
             self.scope_ax_time.clear()
-            self.scope_ax_time.set_xlabel('时间 (秒)', fontsize=10)
-            self.scope_ax_time.set_ylabel('数值', fontsize=10)
-            self.scope_ax_time.set_title('时域波形', fontsize=11, fontweight='bold')
+            self.scope_ax_time.set_xlabel('时间 (秒)', fontsize=12)
+            self.scope_ax_time.set_ylabel('数值', fontsize=12)
+            self.scope_ax_time.set_title('时域波形', fontsize=13, fontweight='bold')
             self.scope_ax_time.grid(True, alpha=0.3, linestyle='--', linewidth=0.5)
             
             # 获取时间窗口
@@ -3290,22 +3365,22 @@ UDP协议格式: [帧头] [日志数据] [帧尾]
                         has_data = True
             
             if has_data:
-                self.scope_ax_time.legend(loc='upper right', fontsize=8)
+                self.scope_ax_time.legend(loc='upper right', fontsize=10)
                 
                 # 设置Y轴范围
                 if not self.scope_auto_scale.get():
                     self.scope_ax_time.set_ylim(-10, 270)
             else:
-                self.scope_ax_time.text(0.5, 0.5, '等待数据...', 
+                self.scope_ax_time.text(0.5, 0.5, '等待数据...',
                                   horizontalalignment='center', verticalalignment='center',
-                                  transform=self.scope_ax_time.transAxes, fontsize=12, color='gray')
+                                  transform=self.scope_ax_time.transAxes, fontsize=14, color='gray')
             
             # === 更新频域图（仅在FFT激活且有数据时） ===
             if self.scope_ax_freq is not None and self.fft_active and self.fft_data:
                 self.scope_ax_freq.clear()
-                self.scope_ax_freq.set_xlabel('频率 (Hz)', fontsize=10)
-                self.scope_ax_freq.set_ylabel('幅值', fontsize=10)
-                self.scope_ax_freq.set_title('频域幅频曲线 (FFT)', fontsize=11, fontweight='bold')
+                self.scope_ax_freq.set_xlabel('频率 (Hz)', fontsize=12)
+                self.scope_ax_freq.set_ylabel('幅值', fontsize=12)
+                self.scope_ax_freq.set_title('频域幅频曲线 (FFT)', fontsize=13, fontweight='bold')
                 self.scope_ax_freq.grid(True, alpha=0.3, linestyle='--', linewidth=0.5)
                 # 绘制FFT结果
                 for key, (freqs, magnitudes, var_name) in self.fft_data.items():
@@ -3318,7 +3393,7 @@ UDP协议格式: [帧头] [日志数据] [帧尾]
                     
                     self.scope_ax_freq.plot(freqs, magnitudes, label=var_name, color=color, linewidth=1.5)
                 
-                self.scope_ax_freq.legend(loc='upper right', fontsize=8)
+                self.scope_ax_freq.legend(loc='upper right', fontsize=10)
                 self.scope_ax_freq.set_xlim(left=0)  # 频率从0开始
                 
                 # 找出主要频率成分（前3个峰值）
@@ -3342,7 +3417,7 @@ UDP协议格式: [帧头] [日志数据] [帧尾]
                                         f'{freqs[idx]:.2f}Hz',
                                         xy=(freqs[idx], magnitudes[idx]),
                                         xytext=(5, 5), textcoords='offset points',
-                                        fontsize=8, color='red',
+                                        fontsize=10, color='red',
                                         bbox=dict(boxstyle='round,pad=0.3', facecolor='yellow', alpha=0.7)
                                     )
                 except ImportError:

@@ -1118,6 +1118,129 @@ class UdpVideoReceiver:
         print("[INFO] UDP receiver stopped")
 
 
+# ---------------------- UDP 发送器 ----------------------
+class UdpSender:
+    """UDP 数据发送器，支持发送自定义格式的数据帧"""
+    
+    def __init__(self):
+        self._sock: Optional[socket.socket] = None
+        self.target_ip = ''
+        self.target_port = 8080
+        self.send_count = 0
+        self.send_history = []  # [(timestamp, data_hex, description), ...]
+        self.max_history = 100
+        
+        # 定时发送相关
+        self._timer_thread: Optional[threading.Thread] = None
+        self._timer_stop_event = threading.Event()
+        self._timer_interval = 1.0  # 秒
+        self._timer_data = b''
+    
+    def connect(self, target_ip: str, target_port: int):
+        """连接到目标地址"""
+        try:
+            if self._sock:
+                self._sock.close()
+            
+            self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.target_ip = target_ip
+            self.target_port = target_port
+            return True
+        except Exception as e:
+            print(f"[ERROR] UDP sender connect failed: {e}")
+            return False
+    
+    def send_data(self, data: bytes, description: str = '') -> bool:
+        """发送数据"""
+        if not self._sock:
+            print("[ERROR] UDP sender not connected")
+            return False
+        
+        try:
+            self._sock.sendto(data, (self.target_ip, self.target_port))
+            self.send_count += 1
+            
+            # 记录历史
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+            data_hex = data[:100].hex() + ('...' if len(data) > 100 else '')
+            self.send_history.append((timestamp, data_hex, description or f"Sent {len(data)} bytes"))
+            
+            # 限制历史记录数量
+            if len(self.send_history) > self.max_history:
+                self.send_history.pop(0)
+            
+            return True
+        except Exception as e:
+            print(f"[ERROR] UDP send failed: {e}")
+            return False
+    
+    def build_custom_frame(self, 
+                          header: str = '', 
+                          footer: str = '', 
+                          payload: bytes = b'') -> bytes:
+        """构建自定义帧格式"""
+        frame = b''
+        
+        # 添加帧头
+        if header:
+            try:
+                frame += bytes.fromhex(header.replace(' ', ''))
+            except:
+                pass
+        
+        # 添加数据
+        frame += payload
+        
+        # 添加帧尾
+        if footer:
+            try:
+                frame += bytes.fromhex(footer.replace(' ', ''))
+            except:
+                pass
+        
+        return frame
+    
+    def start_timer_send(self, data: bytes, interval: float):
+        """启动定时发送"""
+        self.stop_timer_send()
+        
+        self._timer_data = data
+        self._timer_interval = interval
+        self._timer_stop_event.clear()
+        
+        self._timer_thread = threading.Thread(target=self._timer_loop, daemon=True)
+        self._timer_thread.start()
+    
+    def stop_timer_send(self):
+        """停止定时发送"""
+        if self._timer_thread:
+            self._timer_stop_event.set()
+            self._timer_thread.join(timeout=2.0)
+            self._timer_thread = None
+    
+    def _timer_loop(self):
+        """定时发送循环"""
+        print(f"[INFO] Timer send started, interval={self._timer_interval}s")
+        while not self._timer_stop_event.is_set():
+            if self._timer_data:
+                self.send_data(self._timer_data, f"Timer send (interval={self._timer_interval}s)")
+            
+            # 使用事件的wait方法，可以被及时中断
+            self._timer_stop_event.wait(self._timer_interval)
+        
+        print("[INFO] Timer send stopped")
+    
+    def close(self):
+        """关闭发送器"""
+        self.stop_timer_send()
+        
+        if self._sock:
+            try:
+                self._sock.close()
+            except:
+                pass
+            self._sock = None
+
 
 class App(tb.Window):
     def __init__(self):
@@ -1155,6 +1278,9 @@ class App(tb.Window):
         # UDP 视频接收器
         self.video_receiver: Optional[UdpVideoReceiver] = None
         self._video_update_job = None
+        
+        # UDP 数据发送器
+        self.udp_sender: Optional[UdpSender] = None
 
         # --- 参数 ---
         self.ip = tk.StringVar(value='0.0.0.0')
@@ -1191,6 +1317,14 @@ class App(tb.Window):
         self.log_frame_header = tk.StringVar(value='BB66')
         self.log_frame_footer = tk.StringVar(value='0D0A')
         self.log_frame_format = tk.StringVar(value='标准格式')  # 标准格式 / 纯文本
+        
+        # 数据发送配置
+        self.send_target_ip = tk.StringVar(value='192.168.1.100')
+        self.send_target_port = tk.IntVar(value=8080)
+        self.send_frame_header = tk.StringVar(value='AA55')
+        self.send_frame_footer = tk.StringVar(value='0D0A')
+        self.send_interval = tk.DoubleVar(value=1.0)  # 定时发送间隔（秒）
+        self.send_mode = tk.StringVar(value='Hex')  # Hex / Text
 
     # 已移除 C 扩展处理选项（ctypes），保持 GUI 简洁
 
@@ -1289,6 +1423,7 @@ class App(tb.Window):
         nb.pack(fill='both', expand=True, padx=8, pady=4)
 
         nb.add(self._build_tab_run(), text='运行')
+        nb.add(self._build_tab_send(), text='发送')
         nb.add(self._build_tab_video(), text='视频')
         nb.add(self._build_tab_align(), text='对齐')
         nb.add(self._build_tab_scope(), text='示波')
@@ -1428,6 +1563,203 @@ class App(tb.Window):
 
         for c in range(5):
             f.grid_columnconfigure(c, weight=1)
+        return f
+    
+    def _build_tab_send(self):
+        """构建发送数据标签页"""
+        f = ttk.Frame()
+        
+        # 创建Notebook用于分页
+        send_nb = self._nb(f)
+        send_nb.pack(fill='both', expand=True, padx=6, pady=6)
+        
+        # 发送配置页
+        config_tab = self._build_send_config_tab()
+        send_nb.add(config_tab, text='发送配置')
+        
+        # 数据编辑页
+        data_tab = self._build_send_data_tab()
+        send_nb.add(data_tab, text='数据编辑')
+        
+        # 发送历史页
+        history_tab = self._build_send_history_tab()
+        send_nb.add(history_tab, text='发送历史')
+        
+        return f
+    
+    def _build_send_config_tab(self):
+        """构建发送配置标签页"""
+        f = ttk.Frame()
+        
+        row = 0
+        ttk.Label(f, text='目标 IP:', font=('Arial', 10, 'bold')).grid(row=row, column=0, sticky='e', padx=6, pady=6)
+        ttk.Entry(f, textvariable=self.send_target_ip, width=20).grid(row=row, column=1, sticky='w', padx=6)
+        ttk.Label(f, text='例: 192.168.1.100', foreground='gray').grid(row=row, column=2, sticky='w', padx=6)
+        
+        row += 1
+        ttk.Label(f, text='目标端口:', font=('Arial', 10, 'bold')).grid(row=row, column=0, sticky='e', padx=6, pady=6)
+        ttk.Entry(f, textvariable=self.send_target_port, width=10).grid(row=row, column=1, sticky='w', padx=6)
+        
+        row += 1
+        ttk.Separator(f, orient='horizontal').grid(row=row, column=0, columnspan=4, sticky='ew', pady=10)
+        
+        row += 1
+        ttk.Label(f, text='帧头 (Hex):', font=('Arial', 10, 'bold')).grid(row=row, column=0, sticky='e', padx=6, pady=6)
+        ttk.Entry(f, textvariable=self.send_frame_header, width=20, font=('Consolas', 10)).grid(row=row, column=1, sticky='w', padx=6)
+        ttk.Label(f, text='例: AA55', foreground='gray').grid(row=row, column=2, sticky='w', padx=6)
+        
+        row += 1
+        ttk.Label(f, text='帧尾 (Hex):', font=('Arial', 10, 'bold')).grid(row=row, column=0, sticky='e', padx=6, pady=6)
+        ttk.Entry(f, textvariable=self.send_frame_footer, width=20, font=('Consolas', 10)).grid(row=row, column=1, sticky='w', padx=6)
+        ttk.Label(f, text='可选', foreground='gray').grid(row=row, column=2, sticky='w', padx=6)
+        
+        row += 1
+        ttk.Separator(f, orient='horizontal').grid(row=row, column=0, columnspan=4, sticky='ew', pady=10)
+        
+        row += 1
+        ttk.Label(f, text='定时发送间隔:', font=('Arial', 10, 'bold')).grid(row=row, column=0, sticky='e', padx=6, pady=6)
+        interval_frame = ttk.Frame(f)
+        interval_frame.grid(row=row, column=1, sticky='w', padx=6)
+        ttk.Spinbox(interval_frame, textvariable=self.send_interval, from_=0.1, to=60, width=8, increment=0.1).pack(side='left')
+        ttk.Label(interval_frame, text='秒').pack(side='left', padx=(4, 0))
+        
+        row += 1
+        ttk.Separator(f, orient='horizontal').grid(row=row, column=0, columnspan=4, sticky='ew', pady=10)
+        
+        row += 1
+        btn_frame = ttk.Frame(f)
+        btn_frame.grid(row=row, column=1, columnspan=2, sticky='w', padx=6, pady=10)
+        self._btn(btn_frame, text='连接', command=self._connect_sender, bootstyle='success').pack(side='left', padx=2)
+        self._btn(btn_frame, text='断开', command=self._disconnect_sender, bootstyle='warning').pack(side='left', padx=2)
+        
+        row += 1
+        help_text = tk.Text(f, height=8, width=70, wrap='word', font=('Arial', 11))
+        help_text.grid(row=row, column=0, columnspan=4, sticky='we', padx=6, pady=6)
+        
+        help_content = """发送配置说明：
+
+【目标设置】
+- 目标IP: 要发送数据的目标设备IP地址
+- 目标端口: 目标设备的UDP监听端口
+
+【自定义帧格式】
+- 帧头: 可选的帧头标识（十六进制）
+- 帧尾: 可选的帧尾标识（十六进制）
+- 实际发送格式: [帧头] + [数据内容] + [帧尾]
+
+【定时发送】
+- 设置自动发送间隔时间（0.1-60秒）
+- 在"数据编辑"页面配置要发送的数据后，可启动定时发送
+
+使用流程：
+1. 设置目标IP和端口
+2. 点击"连接"按钮建立连接
+3. 在"数据编辑"页面编辑要发送的数据
+4. 使用"单次发送"或"定时发送"功能"""
+        
+        help_text.insert('1.0', help_content)
+        help_text.config(state='disabled')
+        
+        for c in range(4):
+            f.grid_columnconfigure(c, weight=1)
+        
+        return f
+    
+    def _build_send_data_tab(self):
+        """构建数据编辑标签页"""
+        f = ttk.Frame()
+        
+        # 模式选择
+        mode_frame = ttk.Frame(f)
+        mode_frame.pack(fill='x', padx=6, pady=6)
+        
+        ttk.Label(mode_frame, text='编辑模式:', font=('Arial', 10, 'bold')).pack(side='left', padx=(0, 6))
+        ttk.Radiobutton(mode_frame, text='Hex模式', variable=self.send_mode, value='Hex', 
+                       command=self._on_send_mode_changed).pack(side='left', padx=4)
+        ttk.Radiobutton(mode_frame, text='文本模式', variable=self.send_mode, value='Text',
+                       command=self._on_send_mode_changed).pack(side='left', padx=4)
+        
+        # 数据编辑器
+        editor_frame = ttk.LabelFrame(f, text='数据编辑器', padding=10)
+        editor_frame.pack(fill='both', expand=True, padx=6, pady=6)
+        
+        # 创建Text控件
+        self.send_data_text = tk.Text(editor_frame, height=12, width=70, font=('Consolas', 11), wrap='word')
+        scrollbar = ttk.Scrollbar(editor_frame, orient='vertical', command=self.send_data_text.yview)
+        self.send_data_text.configure(yscrollcommand=scrollbar.set)
+        
+        self.send_data_text.pack(side='left', fill='both', expand=True)
+        scrollbar.pack(side='right', fill='y')
+        
+        # 示例文本
+        self.send_data_text.insert('1.0', 'AA55 01020304 0D0A')
+        
+        # 控制按钮
+        btn_frame = ttk.Frame(f)
+        btn_frame.pack(fill='x', padx=6, pady=6)
+        
+        self._btn(btn_frame, text='单次发送', command=self._send_once, bootstyle='primary').pack(side='left', padx=2)
+        self._btn(btn_frame, text='启动定时发送', command=self._start_timer_send, bootstyle='success').pack(side='left', padx=2)
+        self._btn(btn_frame, text='停止定时发送', command=self._stop_timer_send, bootstyle='danger').pack(side='left', padx=2)
+        self._btn(btn_frame, text='清空', command=lambda: self.send_data_text.delete('1.0', 'end'), bootstyle='secondary').pack(side='left', padx=2)
+        
+        # 数据长度显示
+        self.send_data_length_label = ttk.Label(btn_frame, text='数据长度: 0 字节', font=('Arial', 10))
+        self.send_data_length_label.pack(side='right', padx=6)
+        
+        # 绑定文本变化事件
+        self.send_data_text.bind('<<Modified>>', self._on_send_data_changed)
+        
+        # 帮助信息
+        help_frame = ttk.LabelFrame(f, text='格式说明', padding=6)
+        help_frame.pack(fill='x', padx=6, pady=(0, 6))
+        
+        help_label = ttk.Label(help_frame, text=
+            'Hex模式: 输入十六进制数据，空格分隔（例: AA 55 01 02 03 04 0D 0A）\n'
+            '文本模式: 输入普通文本，自动转换为UTF-8字节流\n'
+            '帧头帧尾会自动添加（在"发送配置"页面设置）',
+            font=('Arial', 10), foreground='gray')
+        help_label.pack()
+        
+        return f
+    
+    def _build_send_history_tab(self):
+        """构建发送历史标签页"""
+        f = ttk.Frame()
+        
+        # 工具栏
+        toolbar = ttk.Frame(f)
+        toolbar.pack(fill='x', padx=6, pady=6)
+        
+        self._btn(toolbar, text='清空历史', command=self._clear_send_history, bootstyle='warning').pack(side='left', padx=2)
+        self._btn(toolbar, text='刷新', command=self._refresh_send_history, bootstyle='info-outline').pack(side='left', padx=2)
+        
+        ttk.Label(toolbar, text='发送统计:').pack(side='left', padx=(10, 2))
+        self.send_count_label = ttk.Label(toolbar, text='已发送: 0 包', font=('Arial', 10, 'bold'))
+        self.send_count_label.pack(side='left')
+        
+        # 历史记录列表
+        list_frame = ttk.LabelFrame(f, text='发送历史记录', padding=6)
+        list_frame.pack(fill='both', expand=True, padx=6, pady=6)
+        
+        # 创建Treeview
+        columns = ('time', 'data', 'description')
+        self.send_history_tree = ttk.Treeview(list_frame, columns=columns, show='headings', height=12)
+        
+        self.send_history_tree.heading('time', text='时间')
+        self.send_history_tree.heading('data', text='数据 (Hex)')
+        self.send_history_tree.heading('description', text='说明')
+        
+        self.send_history_tree.column('time', width=180)
+        self.send_history_tree.column('data', width=300)
+        self.send_history_tree.column('description', width=200)
+        
+        scrollbar = ttk.Scrollbar(list_frame, orient='vertical', command=self.send_history_tree.yview)
+        self.send_history_tree.configure(yscrollcommand=scrollbar.set)
+        
+        self.send_history_tree.pack(side='left', fill='both', expand=True)
+        scrollbar.pack(side='right', fill='y')
+        
         return f
 
     def _build_tab_custom_frame(self):
@@ -2044,6 +2376,10 @@ UDP协议格式: [帧头] [日志数据] [帧尾]
         # 停止示波器更新
         if hasattr(self, '_scope_update_job') and self._scope_update_job:
             self.after_cancel(self._scope_update_job)
+        
+        # 关闭UDP发送器
+        if self.udp_sender:
+            self.udp_sender.close()
         
         self.destroy()
     
@@ -2893,6 +3229,200 @@ UDP协议格式: [帧头] [日志数据] [帧尾]
             self.stats_label.config(text='已停止')
         else:
             messagebox.showinfo('提示', '监听未运行')
+    
+    # -------------------- 发送相关回调 --------------------
+    
+    def _connect_sender(self):
+        """连接UDP发送器"""
+        target_ip = self.send_target_ip.get()
+        target_port = self.send_target_port.get()
+        
+        if not target_ip:
+            messagebox.showerror('错误', '请输入目标IP地址')
+            return
+        
+        try:
+            # 验证IP地址格式
+            parts = target_ip.split('.')
+            if len(parts) != 4 or not all(0 <= int(p) <= 255 for p in parts):
+                raise ValueError()
+        except:
+            messagebox.showerror('错误', f'IP地址格式无效: {target_ip}')
+            return
+        
+        if not (1 <= target_port <= 65535):
+            messagebox.showerror('错误', f'端口号无效: {target_port}\n有效范围: 1-65535')
+            return
+        
+        # 创建发送器
+        if not self.udp_sender:
+            self.udp_sender = UdpSender()
+        
+        if self.udp_sender.connect(target_ip, target_port):
+            self._log(f'✓ 连接成功: {target_ip}:{target_port}')
+            messagebox.showinfo('成功', f'已连接到 {target_ip}:{target_port}')
+        else:
+            self._log(f'✗ 连接失败')
+            messagebox.showerror('错误', '连接失败')
+    
+    def _disconnect_sender(self):
+        """断开UDP发送器"""
+        if self.udp_sender:
+            self.udp_sender.close()
+            self.udp_sender = None
+            self._log('✓ 已断开发送器连接')
+            messagebox.showinfo('提示', '已断开连接')
+        else:
+            messagebox.showinfo('提示', '发送器未连接')
+    
+    def _send_once(self):
+        """单次发送数据"""
+        if not self.udp_sender or not self.udp_sender._sock:
+            messagebox.showerror('错误', '请先连接发送器')
+            return
+        
+        # 获取数据
+        data = self._get_send_data()
+        if not data:
+            messagebox.showerror('错误', '请输入要发送的数据')
+            return
+        
+        # 构建帧
+        frame = self.udp_sender.build_custom_frame(
+            header=self.send_frame_header.get(),
+            footer=self.send_frame_footer.get(),
+            payload=data
+        )
+        
+        # 发送
+        if self.udp_sender.send_data(frame, f'单次发送 ({len(frame)} 字节)'):
+            self._log(f'✓ 发送成功: {len(frame)} 字节')
+            self._refresh_send_history()
+            self.send_count_label.config(text=f'已发送: {self.udp_sender.send_count} 包')
+        else:
+            self._log('✗ 发送失败')
+            messagebox.showerror('错误', '发送失败')
+    
+    def _start_timer_send(self):
+        """启动定时发送"""
+        if not self.udp_sender or not self.udp_sender._sock:
+            messagebox.showerror('错误', '请先连接发送器')
+            return
+        
+        # 获取数据
+        data = self._get_send_data()
+        if not data:
+            messagebox.showerror('错误', '请输入要发送的数据')
+            return
+        
+        # 构建帧
+        frame = self.udp_sender.build_custom_frame(
+            header=self.send_frame_header.get(),
+            footer=self.send_frame_footer.get(),
+            payload=data
+        )
+        
+        # 启动定时发送
+        interval = self.send_interval.get()
+        self.udp_sender.start_timer_send(frame, interval)
+        self._log(f'✓ 启动定时发送: 间隔 {interval} 秒')
+        messagebox.showinfo('提示', f'已启动定时发送\n间隔: {interval} 秒')
+    
+    def _stop_timer_send(self):
+        """停止定时发送"""
+        if self.udp_sender:
+            self.udp_sender.stop_timer_send()
+            self._log('✓ 停止定时发送')
+            messagebox.showinfo('提示', '已停止定时发送')
+        else:
+            messagebox.showinfo('提示', '发送器未连接')
+    
+    def _get_send_data(self) -> bytes:
+        """从编辑器获取要发送的数据"""
+        text = self.send_data_text.get('1.0', 'end-1c').strip()
+        if not text:
+            return b''
+        
+        mode = self.send_mode.get()
+        
+        if mode == 'Hex':
+            # Hex模式：去除空格，转换为字节
+            try:
+                hex_str = text.replace(' ', '').replace('\n', '').replace('\r', '')
+                return bytes.fromhex(hex_str)
+            except Exception as e:
+                messagebox.showerror('错误', f'Hex格式错误: {e}')
+                return b''
+        else:
+            # Text模式：转换为UTF-8
+            try:
+                return text.encode('utf-8')
+            except Exception as e:
+                messagebox.showerror('错误', f'文本编码错误: {e}')
+                return b''
+    
+    def _on_send_mode_changed(self):
+        """发送模式改变时的回调"""
+        mode = self.send_mode.get()
+        current_text = self.send_data_text.get('1.0', 'end-1c').strip()
+        
+        if not current_text:
+            # 设置示例文本
+            if mode == 'Hex':
+                self.send_data_text.delete('1.0', 'end')
+                self.send_data_text.insert('1.0', 'AA55 01020304 0D0A')
+            else:
+                self.send_data_text.delete('1.0', 'end')
+                self.send_data_text.insert('1.0', 'Hello, UDP!')
+    
+    def _on_send_data_changed(self, event=None):
+        """数据内容改变时更新长度显示"""
+        try:
+            data = self._get_send_data()
+            if data:
+                # 包含帧头帧尾的总长度
+                frame = self.udp_sender.build_custom_frame(
+                    header=self.send_frame_header.get(),
+                    footer=self.send_frame_footer.get(),
+                    payload=data
+                ) if self.udp_sender else data
+                
+                self.send_data_length_label.config(text=f'数据长度: {len(data)} 字节, 总长度: {len(frame)} 字节')
+            else:
+                self.send_data_length_label.config(text='数据长度: 0 字节')
+            
+            # 重置Modified标志
+            self.send_data_text.edit_modified(False)
+        except:
+            pass
+    
+    def _refresh_send_history(self):
+        """刷新发送历史显示"""
+        if not self.udp_sender:
+            return
+        
+        # 清空现有记录
+        for item in self.send_history_tree.get_children():
+            self.send_history_tree.delete(item)
+        
+        # 添加历史记录
+        for timestamp, data_hex, description in self.udp_sender.send_history:
+            self.send_history_tree.insert('', 'end', values=(timestamp, data_hex, description))
+        
+        # 更新统计
+        self.send_count_label.config(text=f'已发送: {self.udp_sender.send_count} 包')
+    
+    def _clear_send_history(self):
+        """清空发送历史"""
+        if not self.udp_sender:
+            return
+        
+        result = messagebox.askyesno('确认', '确定要清空发送历史吗？')
+        if result:
+            self.udp_sender.send_history.clear()
+            self.udp_sender.send_count = 0
+            self._refresh_send_history()
+            self._log('✓ 已清空发送历史')
 
     def compose_video(self):
         args = [sys.executable, MAIN_SCRIPT, 'video', '--png-dir', self.video_png_dir.get(), '--out', self.video_out.get(), '--fps', str(self.video_fps.get())]

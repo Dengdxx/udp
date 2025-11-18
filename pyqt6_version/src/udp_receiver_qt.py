@@ -608,16 +608,22 @@ class UdpReceiverThread(QThread):
                         # 发送日志信号
                         self.log_received.emit(payload)
                         
-                        # 记录数据包
-                        display_hex = data.hex()
-                        if len(display_hex) > 500:
-                            display_hex = display_hex[:500] + '...'
+                        # 记录数据包 - 传递payload的hex，不是整个UDP包的hex
+                        payload_hex = payload.hex()
+                        if len(payload_hex) > 500:
+                            payload_hex = payload_hex[:500] + '...'
+                        
+                        # 构建更清晰的Info信息
+                        if text_utf8 and text_utf8.isprintable():
+                            info_text = f"Custom LOG [{self.log_frame_format}]: {text_utf8[:50]}" + ('...' if len(text_utf8) > 50 else '')
+                        else:
+                            info_text = f"Custom LOG [{self.log_frame_format}]: Hex={payload_hex[:40]}" + ('...' if len(payload_hex) > 40 else '') + f" ({len(payload)} bytes)"
                         
                         self.data_packet_received.emit(
                             host_iso,
                             'CUSTOM_LOG',
-                            display_hex,
-                            f"Custom LOG: {text_utf8[:50]}" + ('...' if len(text_utf8) > 50 else '')
+                            payload_hex,  # 传递payload的hex，不是整个UDP包
+                            info_text
                         )
                         
                         # 写入 CSV

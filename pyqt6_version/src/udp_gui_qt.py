@@ -8,13 +8,14 @@ import sys
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                               QTabWidget, QLabel, QTextEdit, QSplitter,
                               QMessageBox, QGroupBox, QPushButton, QSpinBox, QComboBox,
-                              QMenuBar, QMenu)
+                              QMenuBar, QMenu, QFileDialog)
 from PyQt6.QtCore import Qt, QTimer, pyqtSlot
 from PyQt6.QtGui import QPixmap, QAction
 import struct
 from collections import deque
 
 import numpy as np
+import cv2
 
 from tab_run import RunTab
 from tab_video import VideoTab
@@ -36,6 +37,12 @@ class MainWindow(QMainWindow):
         self.current_frame = None
         self.stats = {}
         self.current_theme = "dark"  # dark 或 light
+        
+        # MP4 录制相关
+        self.is_recording = False
+        self.video_writer = None
+        self.record_output_path = None
+        self.record_fps = 30
         
         self._create_menu()  # 先创建菜单栏
         self._init_ui()
@@ -233,10 +240,21 @@ class MainWindow(QMainWindow):
         self.video_label.setText("等待视频流...\n请点击 \"启动监听\" 开始接收")
         video_layout.addWidget(self.video_label)
         
-        # 统计信息
+        # 统计信息和录制控制
+        stats_control_layout = QHBoxLayout()
+        
         self.stats_label = QLabel("FPS: 0.0 | 帧数: 0 | 总包: 0 | 错误: 0")
         self.stats_label.setStyleSheet("QLabel { font-size: 10px; font-family: 'Consolas'; padding: 4px; background-color: #2d2d2d; color: #00ff00; }")
-        video_layout.addWidget(self.stats_label)
+        stats_control_layout.addWidget(self.stats_label, 1)
+        
+        # MP4 录制按钮
+        self.record_mp4_btn = QPushButton("⏺ 开始录制")
+        self.record_mp4_btn.setMaximumWidth(120)
+        self.record_mp4_btn.setStyleSheet("QPushButton { font-weight: bold; }")
+        self.record_mp4_btn.clicked.connect(self._toggle_mp4_recording)
+        stats_control_layout.addWidget(self.record_mp4_btn)
+        
+        video_layout.addLayout(stats_control_layout)
         
         layout.addWidget(video_group, 2)
         
@@ -408,6 +426,10 @@ class MainWindow(QMainWindow):
             return
         
         self.log("正在停止 UDP 接收器...")
+        
+        # 停止 MP4 录制（如果正在录制）
+        if self.is_recording:
+            self._stop_recording_mp4()
         
         # 停止线程
         self.receiver_thread.stop()
@@ -1058,6 +1080,127 @@ class MainWindow(QMainWindow):
         if not pixmap.isNull():
             self.video_label.setPixmap(pixmap)
             self.video_label.setStyleSheet("QLabel { background-color: black; }")
+        
+        # MP4 录制
+        if self.is_recording and self.video_writer is not None:
+            try:
+                frame = self.current_frame.copy()
+                
+                # 根据图像类型处理
+                if len(frame.shape) == 2:
+                    # 灰度图，直接写入
+                    self.video_writer.write(frame)
+                elif len(frame.shape) == 3 and frame.shape[2] == 3:
+                    # RGB 图像，需要转换为 BGR
+                    frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                    self.video_writer.write(frame_bgr)
+            except Exception as e:
+                self.log(f"录制帧写入失败: {e}")
+                self._stop_recording_mp4()
+    
+    def _toggle_mp4_recording(self):
+        """切换 MP4 录制状态"""
+        if not self.is_recording:
+            self._start_recording_mp4()
+        else:
+            self._stop_recording_mp4()
+    
+    def _start_recording_mp4(self):
+        """开始 MP4 录制"""
+        if self.current_frame is None:
+            QMessageBox.warning(self, "无法录制", "当前没有视频帧。\n请先启动 UDP 监听并接收到视频数据。")
+            return
+        
+        # 选择保存路径
+        from datetime import datetime
+        default_name = f"record_{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4"
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "保存 MP4 录制文件",
+            default_name,
+            "MP4 视频文件 (*.mp4)"
+        )
+        
+        if not file_path:
+            return
+        
+        # 初始化 VideoWriter
+        try:
+            frame = self.current_frame
+            h, w = frame.shape[:2]
+            
+            # 判断是否为彩色视频
+            is_color = len(frame.shape) == 3 and frame.shape[2] == 3
+            
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            self.video_writer = cv2.VideoWriter(file_path, fourcc, self.record_fps, (w, h), isColor=is_color)
+            
+            if not self.video_writer.isOpened():
+                raise RuntimeError("无法创建 VideoWriter")
+            
+            self.is_recording = True
+            self.record_output_path = file_path
+            
+            # 更新按钮状态
+            self.record_mp4_btn.setText("⏹ 停止录制")
+            self.record_mp4_btn.setStyleSheet("QPushButton { font-weight: bold; background-color: #c50f1f; }")
+            
+            self.log(f"✓ 开始录制 MP4: {file_path}")
+            self.log(f"  分辨率: {w}x{h}, 帧率: {self.record_fps} FPS, 彩色: {is_color}")
+            self.statusBar().showMessage(f"正在录制: {file_path}")
+        
+        except Exception as e:
+            QMessageBox.critical(self, "录制失败", f"无法开始 MP4 录制:\n{e}")
+            self.log(f"✗ MP4 录制失败: {e}")
+            if self.video_writer:
+                self.video_writer.release()
+                self.video_writer = None
+    
+    def _stop_recording_mp4(self):
+        """停止 MP4 录制"""
+        if not self.is_recording:
+            return
+        
+        try:
+            if self.video_writer is not None:
+                self.video_writer.release()
+                self.video_writer = None
+            
+            self.is_recording = False
+            
+            # 更新按钮状态
+            self.record_mp4_btn.setText("⏺ 开始录制")
+            self.record_mp4_btn.setStyleSheet("QPushButton { font-weight: bold; }")
+            
+            self.log(f"✓ MP4 录制已停止: {self.record_output_path}")
+            self.statusBar().showMessage(f"录制完成: {self.record_output_path}")
+            
+            # 询问是否打开文件位置
+            reply = QMessageBox.question(
+                self,
+                "录制完成",
+                f"MP4 录制已完成！\n\n文件保存在:\n{self.record_output_path}\n\n是否打开文件所在目录？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            
+            if reply == QMessageBox.StandardButton.Yes:
+                import os
+                import subprocess
+                import platform
+                
+                file_dir = os.path.dirname(os.path.abspath(self.record_output_path))
+                
+                # 根据操作系统打开文件管理器
+                system = platform.system()
+                if system == "Windows":
+                    os.startfile(file_dir)
+                elif system == "Darwin":  # macOS
+                    subprocess.run(["open", file_dir])
+                else:  # Linux
+                    subprocess.run(["xdg-open", file_dir])
+        
+        except Exception as e:
+            self.log(f"✗ 停止录制时出错: {e}")
     
     def log(self, message: str):
         """添加日志"""
@@ -1068,6 +1211,10 @@ class MainWindow(QMainWindow):
     
     def closeEvent(self, event):
         """窗口关闭事件"""
+        # 停止 MP4 录制
+        if self.is_recording:
+            self._stop_recording_mp4()
+        
         # 停止接收器
         if self.receiver_thread and self.receiver_thread.isRunning():
             self.receiver_thread.stop()

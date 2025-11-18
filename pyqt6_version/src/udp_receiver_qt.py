@@ -92,6 +92,56 @@ def decode_image_by_format(pixel_data: bytes, h: int, w: int, format_type: str) 
         img = np.where(pixels > 127, 255, 0).astype(np.uint8)
         return img.reshape((h, w))
     
+    elif format_type == '二值图(自定义8位)':
+        if len(pixel_data) < pixel_count:
+            raise ValueError(f"custom 8bit binary image data too short: need {pixel_count}, got {len(pixel_data)}")
+        pixels = np.frombuffer(pixel_data[:pixel_count], dtype=np.uint8)
+        
+        # 创建彩色图像 (h, w, 3)
+        img_rgb = np.zeros((pixel_count, 3), dtype=np.uint8)
+        
+        # 0 和 255 保持黑白
+        black_mask = (pixels == 0)
+        white_mask = (pixels == 255)
+        img_rgb[black_mask] = [0, 0, 0]
+        img_rgb[white_mask] = [255, 255, 255]
+        
+        # 其他值 (1-254) 映射为彩色
+        # 使用 HSV 色轮映射: 不同的值映射到不同的色相
+        color_mask = ~(black_mask | white_mask)
+        color_indices = np.where(color_mask)[0]
+        
+        if len(color_indices) > 0:
+            color_values = pixels[color_indices]
+            # 将 1-254 映射到色相环 0-360 度
+            # 排除 0 和 255，所以有效范围是 1-254
+            hue = ((color_values - 1) * 360.0 / 254.0).astype(np.float32)
+            
+            # 转换 HSV 到 RGB (S=1.0, V=1.0 for 鲜艳颜色)
+            # 使用简化的 HSV->RGB 转换
+            h_norm = hue / 60.0
+            h_int = h_norm.astype(np.int32) % 6
+            f = h_norm - np.floor(h_norm)
+            
+            for i, idx in enumerate(color_indices):
+                hi = h_int[i]
+                fi = f[i]
+                
+                if hi == 0:
+                    img_rgb[idx] = [255, int(fi * 255), 0]
+                elif hi == 1:
+                    img_rgb[idx] = [int((1 - fi) * 255), 255, 0]
+                elif hi == 2:
+                    img_rgb[idx] = [0, 255, int(fi * 255)]
+                elif hi == 3:
+                    img_rgb[idx] = [0, int((1 - fi) * 255), 255]
+                elif hi == 4:
+                    img_rgb[idx] = [int(fi * 255), 0, 255]
+                else:  # hi == 5
+                    img_rgb[idx] = [255, 0, int((1 - fi) * 255)]
+        
+        return img_rgb.reshape((h, w, 3))
+    
     elif format_type == '压缩二值(1位)':
         expected_bytes = (pixel_count + 7) // 8
         if len(pixel_data) < expected_bytes:
